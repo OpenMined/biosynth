@@ -178,32 +178,32 @@ jobs:
           # Linux
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary: bv
+            binary: bvs
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            binary: bv
+            binary: bvs
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            binary: bv
+            binary: bvs
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
-            binary: bv
+            binary: bvs
           
           # macOS
           - os: macos-latest
             target: x86_64-apple-darwin
-            binary: bv
+            binary: bvs
           - os: macos-latest
             target: aarch64-apple-darwin
-            binary: bv
+            binary: bvs
           
           # Windows
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary: bv.exe
+            binary: bvs.exe
           - os: windows-latest
             target: aarch64-pc-windows-msvc
-            binary: bv.exe
+            binary: bvs.exe
 
     steps:
       - uses: actions/checkout@v4
@@ -251,19 +251,19 @@ jobs:
         run: |
           cd cli/target/${{ matrix.target }}/release
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            7z a ../../../../bv-${{ matrix.target }}.zip ${{ matrix.binary }}
+            7z a ../../../../bvs-${{ matrix.target }}.zip ${{ matrix.binary }}
           else
-            tar czf ../../../../bv-${{ matrix.target }}.tar.gz ${{ matrix.binary }}
+            tar czf ../../../../bvs-${{ matrix.target }}.tar.gz ${{ matrix.binary }} *
           fi
           cd -
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bv-${{ matrix.target }}
+          name: bvs-${{ matrix.target }}
           path: |
-            bv-${{ matrix.target }}.tar.gz
-            bv-${{ matrix.target }}.zip
+            bvs-${{ matrix.target }}.tar.gz
+            bvs-${{ matrix.target }}.zip
 
   publish-crate:
     name: Publish to crates.io
