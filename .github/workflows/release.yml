@@ -270,9 +270,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build, check-version, bump-version]
     if: |
-      always() && 
+      always() &&
       needs.build.result == 'success' &&
-      (needs.bump-version.result == 'success' || needs.bump-version.result == 'skipped')
+      (needs.bump-version.result == 'success' || needs.bump-version.result == 'skipped') &&
+      vars.PUBLISH_CRATE == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
