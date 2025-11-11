@@ -6,7 +6,6 @@ rust-version = "1.91"
 authors = ["Madhava Jay <madhava@openmined.org>"]
 license = "Apache-2.0"
 description = "Biosynth CLI: synthetic data generator for BioVault"
-readme = "../README.md"
 repository = "https://github.com/openmined/biosynth"
 keywords = ["cli", "bioinformatics", "data", "synthetic"]
 categories = ["command-line-utilities", "science"]
