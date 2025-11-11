@@ -10,7 +10,6 @@ readme = "../README.md"
 repository = "https://github.com/openmined/biosynth"
 keywords = ["cli", "bioinformatics", "data", "synthetic"]
 categories = ["command-line-utilities", "science"]
-publish = false
 
 [[bin]]
 name = "bvs"
