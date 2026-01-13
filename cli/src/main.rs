@@ -10,12 +10,14 @@ mod util;
 
 use crate::commands::allele_report::run_allele_report;
 use crate::commands::genostats::run_genostats;
+use crate::commands::genotype_to_vcf::run_genotype_to_vcf;
 use crate::commands::reference_load::run_reference_load;
 use crate::commands::synthetic::run_synthetic;
 
 mod commands {
     pub mod allele_report;
     pub mod genostats;
+    pub mod genotype_to_vcf;
     pub mod reference_load;
     pub mod synthetic;
 }
@@ -33,6 +35,8 @@ enum Commands {
     Genostats(GenostatsArgs),
     /// Export an HTML report of observed alleles per rsid.
     AlleleReport(AlleleReportArgs),
+    /// Convert a genotype file into a single-sample VCF.
+    GenotypeToVcf(GenotypeToVcfArgs),
     /// Load reference allele lookup data into SQLite.
     ReferenceLoad(ReferenceLoadArgs),
     /// Generate a reference genotype file from stored data.
@@ -79,6 +83,31 @@ pub struct ReferenceLoadArgs {
     /// CSV produced by `scripts/extract_reference_variants.py`.
     #[arg(long)]
     pub lookup: PathBuf,
+}
+
+#[derive(Args, Clone)]
+pub struct GenotypeToVcfArgs {
+    /// Input genotype file (tab/space/comma-delimited).
+    #[arg(short = 'i', long = "input")]
+    pub input: PathBuf,
+    /// Path to the SQLite database containing rsid_reference data.
+    #[arg(long, default_value = "data/genostats.sqlite")]
+    pub sqlite: PathBuf,
+    /// Output VCF path (defaults to <input>.vcf or <input>.vcf.gz when --gzip is used).
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    /// Sample name to use in the VCF header (defaults to input filename stem).
+    #[arg(long)]
+    pub sample: Option<String>,
+    /// Optional log file for missing or invalid rows (defaults to stderr).
+    #[arg(long)]
+    pub missing_log: Option<PathBuf>,
+    /// Gzip the output VCF (requires output path to end with .gz).
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub gzip: bool,
+    /// Include GS/BAF/LRR columns as FORMAT fields when present.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub include_metrics: bool,
 }
 
 #[derive(Args, Clone)]
@@ -142,6 +171,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Genostats(args) => run_genostats(args),
         Commands::AlleleReport(args) => run_allele_report(args),
+        Commands::GenotypeToVcf(args) => run_genotype_to_vcf(args),
         Commands::ReferenceLoad(args) => run_reference_load(args),
         Commands::Synthetic(args) => run_synthetic(args),
     }
