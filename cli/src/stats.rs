@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -170,6 +171,73 @@ impl StatsStore {
         Ok(references)
     }
 
+    pub fn all_references_with_overrides(&self) -> Result<Vec<ReferenceVariant>> {
+        let conn = self.open_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT rsid, chromosome, position, reference, alternates
+             FROM rsid_reference_user
+             UNION ALL
+             SELECT rsid, chromosome, position, reference, alternates
+             FROM rsid_reference
+             WHERE rsid NOT IN (SELECT rsid FROM rsid_reference_user)
+             ORDER BY rsid",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut references = Vec::new();
+        while let Some(row) = rows.next()? {
+            references.push(ReferenceVariant {
+                rsid: row.get(0)?,
+                chromosome: row.get(1)?,
+                position: row.get(2)?,
+                reference: row.get(3)?,
+                alternates: row.get(4)?,
+            });
+        }
+        Ok(references)
+    }
+
+    pub fn known_rsids(&self) -> Result<HashSet<i64>> {
+        let conn = self.open_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT rsid FROM rsid_reference
+             UNION
+             SELECT rsid FROM rsid_reference_user",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut rsids = HashSet::new();
+        while let Some(row) = rows.next()? {
+            let rsid: i64 = row.get(0)?;
+            rsids.insert(rsid);
+        }
+        Ok(rsids)
+    }
+
+    pub fn upsert_user_reference_in_tx(
+        tx: &Transaction<'_>,
+        reference: &ReferenceVariant,
+        source: Option<&str>,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO rsid_reference_user (rsid, chromosome, position, reference, alternates, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(rsid) DO UPDATE SET
+                chromosome=excluded.chromosome,
+                position=excluded.position,
+                reference=excluded.reference,
+                alternates=excluded.alternates,
+                source=excluded.source",
+            params![
+                reference.rsid,
+                reference.chromosome,
+                reference.position,
+                reference.reference,
+                reference.alternates,
+                source,
+            ],
+        )?;
+        Ok(())
+    }
+
     fn collect_category_counts(
         &self,
         conn: &Connection,
@@ -207,7 +275,18 @@ fn init_schema(conn: &Connection) -> Result<()> {
             alternates TEXT NOT NULL,
             FOREIGN KEY(format_id) REFERENCES formats(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS rsid_reference_user (
+            rsid INTEGER PRIMARY KEY,
+            format_id INTEGER NOT NULL DEFAULT 1,
+            chromosome TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            reference TEXT NOT NULL,
+            alternates TEXT NOT NULL,
+            source TEXT,
+            FOREIGN KEY(format_id) REFERENCES formats(id) ON DELETE CASCADE
+        );
         CREATE INDEX IF NOT EXISTS idx_rsid_reference_format ON rsid_reference(format_id);
+        CREATE INDEX IF NOT EXISTS idx_rsid_reference_user_format ON rsid_reference_user(format_id);
         "#,
     )?;
     seed_formats(conn)?;
