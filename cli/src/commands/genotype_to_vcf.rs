@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -9,58 +9,104 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
 use crate::download::ensure_reference_db;
+use crate::genotype_reader::{detect_delimiter, RowOutcome, RowParser};
+use crate::rsid_cache::{default_cache_path, normalize_rsid, RsidCache};
 use crate::stats::{ReferenceVariant, StatsStore};
+use crate::util::collect_input_files;
 use crate::GenotypeToVcfArgs;
 
 const LOOKAHEAD_LINES: usize = 2048;
-const COMMENT_PREFIXES: [&str; 2] = ["#", "//"];
-
-const RSID_ALIASES: &[&str] = &["rsid", "name", "snp", "marker", "id"];
-const CHROM_ALIASES: &[&str] = &["chromosome", "chr", "chrom"];
-const POSITION_ALIASES: &[&str] = &[
-    "position",
-    "pos",
-    "coordinate",
-    "basepairposition",
-    "basepair",
+const DEFAULT_GQ: &str = "10";
+const DEFAULT_DP: &str = "10";
+const MISSING_GENOTYPES: [&str; 4] = ["--", "NN", "00", ".."];
+const CONTIG_HEADERS: [&str; 25] = [
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17",
+    "18", "19", "20", "21", "22", "X", "Y", "MT",
 ];
-const GENOTYPE_ALIASES: &[&str] = &[
-    "genotype",
-    "gt",
-    "result",
-    "results",
-    "call",
-    "calls",
-    "yourcode",
-    "code",
-    "genotypevalue",
-    "variation",
-];
-const ALLELE1_ALIASES: &[&str] = &["allele1", "allelea", "allele_a", "allele1top"];
-const ALLELE2_ALIASES: &[&str] = &["allele2", "alleleb", "allele_b", "allele2top"];
-const GS_ALIASES: &[&str] = &["gs", "gscore", "genotypescore", "score"];
-const BAF_ALIASES: &[&str] = &["baf", "b_allele_freq", "ballelefrequency"];
-const LRR_ALIASES: &[&str] = &["lrr", "logrratio", "logr"];
 
 pub fn run_genotype_to_vcf(args: GenotypeToVcfArgs) -> Result<()> {
-    if !args.input.exists() {
-        bail!("Input genotype file not found: {:?}", args.input);
+    if args.inputs.is_empty() {
+        bail!("Provide at least one --input path");
+    }
+    let inputs = collect_input_files(&args.inputs)?;
+    if inputs.is_empty() {
+        bail!("No genotype files discovered in the provided inputs");
+    }
+    if inputs.len() > 1 && args.output.is_some() {
+        bail!("--output can only be used with a single input file");
+    }
+    if inputs.len() > 1 && args.sample.is_some() {
+        bail!("--sample can only be used with a single input file");
+    }
+    if inputs.len() > 1 && args.missing_log.is_some() {
+        bail!("--missing-log can only be used with a single input file");
     }
 
     let sqlite_path = ensure_reference_db(Some(&args.sqlite))?;
     let store = StatsStore::connect(&sqlite_path)?;
     let reference_map = load_reference_map(&store)?;
 
-    let output_paths = resolve_output_paths(&args)?;
-    if let Some(parent) = output_paths.write_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Create output directory {:?}", parent))?;
+    let cache_path = args.cache.clone().unwrap_or_else(default_cache_path);
+    let cache = if cache_path.exists() {
+        RsidCache::load(&cache_path)?
+    } else {
+        RsidCache::default()
+    };
+
+    for input in inputs {
+        let output_paths = resolve_output_paths(&args, &input)?;
+        if let Some(parent) = output_paths.write_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("Create output directory {:?}", parent))?;
+            }
         }
+
+        let sample_name = args
+            .sample
+            .clone()
+            .unwrap_or_else(|| default_sample_name(&input));
+        let missing_log_path = args
+            .missing_log
+            .clone()
+            .unwrap_or_else(|| default_log_path(&output_paths.write_path));
+
+        let stats = convert_file(
+            &input,
+            &output_paths,
+            &reference_map,
+            &cache,
+            &sample_name,
+            &missing_log_path,
+            args.include_metrics,
+        )?;
+
+        println!(
+            "✅ Wrote {} VCF rows to {} (unresolved {})",
+            stats.written_rows,
+            output_paths.final_path.display(),
+            stats.unresolved_rows
+        );
+        println!(
+            "📝 Missing/invalid rows logged to {}",
+            missing_log_path.display()
+        );
     }
 
-    let input = File::open(&args.input).with_context(|| format!("Open {:?}", args.input))?;
-    let mut reader = BufReader::new(input);
+    Ok(())
+}
+
+fn convert_file(
+    input: &Path,
+    output_paths: &OutputPaths,
+    reference_map: &HashMap<i64, ReferenceVariant>,
+    cache: &RsidCache,
+    sample_name: &str,
+    missing_log_path: &Path,
+    include_metrics: bool,
+) -> Result<ConversionStats> {
+    let input_file = File::open(input).with_context(|| format!("Open {:?}", input))?;
+    let mut reader = BufReader::new(input_file);
     let mut buffered_lines = Vec::new();
     let mut buffer = String::new();
 
@@ -74,26 +120,16 @@ pub fn run_genotype_to_vcf(args: GenotypeToVcfArgs) -> Result<()> {
     }
 
     if buffered_lines.is_empty() {
-        bail!("Input file {:?} is empty", args.input);
+        bail!("Input file {:?} is empty", input);
     }
 
     let delimiter = detect_delimiter(&buffered_lines);
     let mut parser = RowParser::new(delimiter);
 
-    let sample_name = args
-        .sample
-        .clone()
-        .unwrap_or_else(|| default_sample_name(&args.input));
-    let missing_log_path = args
-        .missing_log
-        .clone()
-        .unwrap_or_else(|| default_log_path(&output_paths.write_path));
-
     let mut stats = ConversionStats::default();
-    let mut parsed_rows: Vec<GenotypeRow> = Vec::new();
-
+    let mut rows = Vec::new();
     for line in &buffered_lines {
-        collect_row(line, &mut parser, &mut parsed_rows, &mut stats)?;
+        collect_row(line, &mut parser, &mut rows, &mut stats)?;
     }
 
     buffer.clear();
@@ -103,7 +139,7 @@ pub fn run_genotype_to_vcf(args: GenotypeToVcfArgs) -> Result<()> {
         if bytes == 0 {
             break;
         }
-        collect_row(&buffer, &mut parser, &mut parsed_rows, &mut stats)?;
+        collect_row(&buffer, &mut parser, &mut rows, &mut stats)?;
     }
 
     let thread_count = std::thread::available_parallelism()
@@ -115,20 +151,18 @@ pub fn run_genotype_to_vcf(args: GenotypeToVcfArgs) -> Result<()> {
         .context("build genotype-to-vcf thread pool")?;
 
     let results = pool.install(|| {
-        parsed_rows
-            .par_iter()
-            .map(|row| convert_row(&reference_map, row, args.include_metrics))
+        rows.par_iter()
+            .map(|row| convert_row(reference_map, cache, row, include_metrics))
             .collect::<Vec<RowResult>>()
     });
 
-    let contigs = collect_contigs(&parsed_rows);
     let mut writer = BufWriter::new(
         File::create(&output_paths.write_path)
             .with_context(|| format!("Create {:?}", output_paths.write_path))?,
     );
-    write_vcf_header(&mut writer, &sample_name, &contigs, args.include_metrics)?;
+    write_vcf_header(&mut writer, sample_name, include_metrics)?;
 
-    let mut missing_logger = MissingLogger::new(Some(&missing_log_path))?;
+    let mut missing_logger = MissingLogger::new(Some(missing_log_path))?;
     for result in results {
         stats.add(&result.stats);
         for message in result.logs {
@@ -146,38 +180,13 @@ pub fn run_genotype_to_vcf(args: GenotypeToVcfArgs) -> Result<()> {
         gzip_output(&output_paths.write_path)?;
     }
 
-    println!(
-        "✅ Wrote {} VCF rows to {}",
-        stats.written_rows,
-        output_paths.final_path.display()
-    );
-    println!(
-        "📝 Missing/invalid rows logged to {}",
-        missing_log_path.display()
-    );
-    if stats.skipped_rows > 0
-        || stats.invalid_rsid > 0
-        || stats.missing_reference > 0
-        || stats.missing_genotype > 0
-        || stats.unknown_allele > 0
-    {
-        eprintln!(
-            "⚠️ Skipped rows: {}, invalid rsids: {}, missing refs: {}, missing genotypes: {}, unknown alleles: {}",
-            stats.skipped_rows,
-            stats.invalid_rsid,
-            stats.missing_reference,
-            stats.missing_genotype,
-            stats.unknown_allele
-        );
-    }
-
-    Ok(())
+    Ok(stats)
 }
 
 fn collect_row(
     line: &str,
     parser: &mut RowParser,
-    rows: &mut Vec<GenotypeRow>,
+    rows: &mut Vec<crate::genotype_reader::GenotypeRow>,
     stats: &mut ConversionStats,
 ) -> Result<()> {
     match parser.consume_line(line)? {
@@ -193,7 +202,8 @@ fn collect_row(
 
 fn convert_row(
     reference_map: &HashMap<i64, ReferenceVariant>,
-    row: &GenotypeRow,
+    cache: &RsidCache,
+    row: &crate::genotype_reader::GenotypeRow,
     include_metrics: bool,
 ) -> RowResult {
     let mut result = RowResult::default();
@@ -204,103 +214,157 @@ fn convert_row(
         return result;
     }
 
-    let rsid_value = strip_rsid_prefix(rsid_label);
-    let rsid_int: i64 = match rsid_value.parse() {
-        Ok(value) => value,
-        Err(_) => {
-            result.stats.invalid_rsid += 1;
-            result.logs.push(format!("invalid_rsid: {rsid_label}"));
-            return result;
-        }
-    };
+    let resolved = resolve_reference(rsid_label, reference_map, cache);
+    let mut unresolved = false;
+    let mut reference = "N".to_string();
+    let mut alternates: Vec<String> = Vec::new();
 
-    let reference = match reference_map.get(&rsid_int) {
-        Some(reference) => reference,
-        None => {
-            result.stats.missing_reference += 1;
-            result.logs.push(format!("missing_reference: {rsid_label}"));
-            return result;
-        }
-    };
-
-    let ref_allele = normalize_sequence(&reference.reference);
-    if ref_allele.is_empty() {
+    if let Some(resolved_ref) = resolved.as_ref() {
+        reference = resolved_ref.reference.clone();
+        alternates = resolved_ref.alternates.clone();
+    } else {
+        unresolved = true;
         result.stats.missing_reference += 1;
-        result.logs.push(format!("empty_reference: {rsid_label}"));
-        return result;
+        result.logs.push(format!("missing_reference: {rsid_label}"));
     }
 
-    let mut alt_list = parse_alternates(&reference.alternates);
-
-    let alleles = row.genotype.as_deref().and_then(parse_genotype_alleles);
-    if let Some((a1, a2)) = alleles.as_ref() {
-        append_observed_alt(&mut alt_list, &ref_allele, a1);
-        append_observed_alt(&mut alt_list, &ref_allele, a2);
-    }
-
-    let gt = match alleles {
-        Some((a1, a2)) => {
-            let kind = classify_variant(&ref_allele, &alt_list);
-            let idx1 = map_allele_index(&a1, &ref_allele, &alt_list, kind);
-            let idx2 = map_allele_index(&a2, &ref_allele, &alt_list, kind);
-            match (idx1, idx2) {
-                (Some(i1), Some(i2)) => format!("{}/{}", i1.min(i2), i1.max(i2)),
-                _ => {
-                    result.stats.unknown_allele += 1;
-                    result
-                        .logs
-                        .push(format!("unknown_allele: {rsid_label} {a1}/{a2}"));
-                    "./.".to_string()
-                }
-            }
-        }
-        None => {
+    let (gt_call, gt_unresolved, used_indel) = if resolved.is_some() {
+        build_genotype_call(row.genotype.as_deref(), &reference, &alternates)
+    } else {
+        ("./.".to_string(), true, false)
+    };
+    if gt_unresolved {
+        unresolved = true;
+        if resolved.is_some() {
             result.stats.missing_genotype += 1;
             result.logs.push(format!("missing_genotype: {rsid_label}"));
-            "./.".to_string()
         }
-    };
+    } else if used_indel {
+        result.logs.push(format!(
+            "indel_inferred: {rsid_label} {} -> {} (ref={}, alt={})",
+            row.genotype.clone().unwrap_or_default(),
+            gt_call,
+            reference,
+            alternates.join(",")
+        ));
+    }
 
-    let alt_field = if alt_list.is_empty() {
+    let alt_field = if alternates.is_empty() {
         ".".to_string()
     } else {
-        alt_list.join(",")
+        alternates.join(",")
     };
+
+    let mut info_fields = vec![
+        format!("GQ={DEFAULT_GQ}"),
+        format!("DP={DEFAULT_DP}"),
+        format!("FORCE_RSID={}", rsid_label),
+    ];
+    if unresolved {
+        info_fields.push("UNRESOLVED".to_string());
+        result.stats.unresolved_rows += 1;
+    }
+    let info_field = info_fields.join(";");
 
     let (format_field, sample_field) = if include_metrics {
         let gs = row.gs.clone().unwrap_or_else(|| ".".to_string());
         let baf = row.baf.clone().unwrap_or_else(|| ".".to_string());
         let lrr = row.lrr.clone().unwrap_or_else(|| ".".to_string());
         (
-            "GT:GS:BAF:LRR".to_string(),
-            format!("{gt}:{gs}:{baf}:{lrr}"),
+            "GT:GQ:DP:GS:BAF:LRR".to_string(),
+            format!("{gt_call}:{DEFAULT_GQ}:{DEFAULT_DP}:{gs}:{baf}:{lrr}"),
         )
     } else {
-        ("GT".to_string(), gt.clone())
+        (
+            "GT:GQ:DP".to_string(),
+            format!("{gt_call}:{DEFAULT_GQ}:{DEFAULT_DP}"),
+        )
     };
 
     result.stats.written_rows += 1;
     result.line = Some(format!(
-        "{}\t{}\t{}\t{}\t{}\t.\tPASS\t.\t{}\t{}\n",
-        row.chrom, row.pos, rsid_label, ref_allele, alt_field, format_field, sample_field
+        "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}\t{}\n",
+        row.chrom,
+        row.pos,
+        rsid_label,
+        reference,
+        alt_field,
+        info_field,
+        format_field,
+        sample_field
     ));
     result
+}
+
+fn resolve_reference(
+    rsid: &str,
+    reference_map: &HashMap<i64, ReferenceVariant>,
+    cache: &RsidCache,
+) -> Option<ResolvedReference> {
+    let rsid_norm = normalize_rsid(rsid);
+    let rsid_int = rsid_norm.trim_start_matches("rs").parse::<i64>().ok()?;
+    if let Some(reference) = reference_map.get(&rsid_int) {
+        let alternates = parse_alternates(&reference.alternates);
+        if !reference.reference.is_empty() && !alternates.is_empty() {
+            return Some(ResolvedReference {
+                reference: normalize_sequence(&reference.reference),
+                alternates,
+            });
+        }
+    }
+
+    if let Some(entry) = cache.get(&rsid_norm) {
+        let alternates = parse_alternates(&entry.alternates);
+        if !entry.reference.is_empty() && !alternates.is_empty() {
+            return Some(ResolvedReference {
+                reference: normalize_sequence(&entry.reference),
+                alternates,
+            });
+        }
+    }
+
+    None
 }
 
 fn write_vcf_header(
     writer: &mut BufWriter<File>,
     sample_name: &str,
-    contigs: &[String],
     include_metrics: bool,
 ) -> Result<()> {
     writeln!(writer, "##fileformat=VCFv4.2")?;
-    writeln!(writer, "##source=bvs genotype-to-vcf")?;
-    for contig in contigs {
-        writeln!(writer, "##contig=<ID={}>", contig)?;
-    }
+    writeln!(writer, "##source=DynamicDNA")?;
+    writeln!(writer, "##reference=hg38")?;
+    writeln!(
+        writer,
+        "##INFO=<ID=GQ,Number=1,Type=Integer,Description=\"Genotype Quality\">"
+    )?;
+    writeln!(
+        writer,
+        "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">"
+    )?;
+    writeln!(
+        writer,
+        "##INFO=<ID=FORCE_RSID,Number=1,Type=String,Description=\"Forced RSID\">"
+    )?;
+    writeln!(
+        writer,
+        "##INFO=<ID=UNRESOLVED,Number=0,Type=Flag,Description=\"Non-ACGT or missing genotype\">"
+    )?;
+    writeln!(
+        writer,
+        "##FILTER=<ID=PASS,Description=\"All filters passed\">"
+    )?;
     writeln!(
         writer,
         "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
+    )?;
+    writeln!(
+        writer,
+        "##FORMAT=<ID=GQ,Number=1,Type=Integer,Description=\"Genotype Quality\">"
+    )?;
+    writeln!(
+        writer,
+        "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">"
     )?;
     if include_metrics {
         writeln!(
@@ -316,6 +380,9 @@ fn write_vcf_header(
             "##FORMAT=<ID=LRR,Number=1,Type=Float,Description=\"Log R ratio\">"
         )?;
     }
+    for contig in CONTIG_HEADERS {
+        writeln!(writer, "##contig=<ID={}>", contig)?;
+    }
     writeln!(
         writer,
         "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t{}",
@@ -324,10 +391,11 @@ fn write_vcf_header(
     Ok(())
 }
 
-fn resolve_output_paths(args: &GenotypeToVcfArgs) -> Result<OutputPaths> {
-    let output = match &args.output {
-        Some(path) => path.clone(),
-        None => default_output_path(&args.input, args.gzip),
+fn resolve_output_paths(args: &GenotypeToVcfArgs, input: &Path) -> Result<OutputPaths> {
+    let output = if let Some(path) = &args.output {
+        path.clone()
+    } else {
+        default_output_path(input, args.outdir.as_ref(), args.gzip)
     };
 
     let output_is_gz = output
@@ -354,26 +422,48 @@ fn resolve_output_paths(args: &GenotypeToVcfArgs) -> Result<OutputPaths> {
     })
 }
 
-fn default_output_path(input: &Path, gzip: bool) -> PathBuf {
-    let base = input.with_extension("vcf");
-    if gzip {
-        base.with_extension("vcf.gz")
+fn default_output_path(input: &Path, outdir: Option<&PathBuf>, gzip: bool) -> PathBuf {
+    let base_name = input
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("output");
+    let filename = if gzip {
+        format!("{base_name}.vcf.gz")
     } else {
-        base
+        format!("{base_name}.vcf")
+    };
+    if let Some(outdir) = outdir {
+        outdir.join(filename)
+    } else {
+        input.with_file_name(filename)
+    }
+}
+
+fn default_log_path(output_path: &Path) -> PathBuf {
+    if output_path.extension().and_then(|ext| ext.to_str()) == Some("gz") {
+        let without_gz = output_path.with_extension("");
+        without_gz.with_extension("vcf.log")
+    } else {
+        output_path.with_extension("vcf.log")
     }
 }
 
 fn default_sample_name(input: &Path) -> String {
+    let base = input
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("SAMPLE");
+    if let Some((prefix, _)) = base.split_once('_') {
+        if !prefix.is_empty() {
+            return prefix.to_string();
+        }
+    }
     input
         .file_stem()
         .and_then(|stem| stem.to_str())
         .map(|stem| stem.replace(' ', "_"))
         .filter(|stem| !stem.is_empty())
         .unwrap_or_else(|| "SAMPLE".to_string())
-}
-
-fn default_log_path(output_path: &Path) -> PathBuf {
-    output_path.with_extension("vcf.log")
 }
 
 fn gzip_output(path: &Path) -> Result<()> {
@@ -388,6 +478,7 @@ fn gzip_output(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 struct OutputPaths {
     write_path: PathBuf,
     final_path: PathBuf,
@@ -402,7 +493,7 @@ struct ConversionStats {
     invalid_rsid: usize,
     missing_reference: usize,
     missing_genotype: usize,
-    unknown_allele: usize,
+    unresolved_rows: usize,
 }
 
 impl ConversionStats {
@@ -413,7 +504,7 @@ impl ConversionStats {
         self.invalid_rsid += other.invalid_rsid;
         self.missing_reference += other.missing_reference;
         self.missing_genotype += other.missing_genotype;
-        self.unknown_allele += other.unknown_allele;
+        self.unresolved_rows += other.unresolved_rows;
     }
 }
 
@@ -429,7 +520,7 @@ struct MissingLogger {
 }
 
 impl MissingLogger {
-    fn new(path: Option<&PathBuf>) -> Result<Self> {
+    fn new(path: Option<&Path>) -> Result<Self> {
         let writer: Box<dyn Write> = match path {
             Some(path) => {
                 if let Some(parent) = path.parent() {
@@ -457,328 +548,123 @@ impl MissingLogger {
     }
 }
 
-#[derive(Debug, Clone)]
-struct GenotypeRow {
-    rsid: String,
-    chrom: String,
-    pos: i64,
-    genotype: Option<String>,
-    gs: Option<String>,
-    baf: Option<String>,
-    lrr: Option<String>,
+struct ResolvedReference {
+    reference: String,
+    alternates: Vec<String>,
 }
 
-enum RowOutcome {
-    Parsed(GenotypeRow),
-    Skipped,
-    Ignored,
-}
+fn build_genotype_call(
+    genotype: Option<&str>,
+    reference: &str,
+    alternates: &[String],
+) -> (String, bool, bool) {
+    let Some(genotype) = genotype else {
+        return ("./.".to_string(), true, false);
+    };
+    let trimmed = genotype.trim().to_uppercase();
+    if trimmed.is_empty() || MISSING_GENOTYPES.contains(&trimmed.as_str()) {
+        return ("./.".to_string(), true, false);
+    }
 
-#[derive(Debug, Clone, Copy)]
-enum Delimiter {
-    Tab,
-    Comma,
-    Space,
-}
-
-struct RowParser {
-    delimiter: Delimiter,
-    header: Option<Vec<String>>,
-    comment_header: Option<Vec<String>>,
-    alias_map: HashMap<&'static str, BTreeSet<&'static str>>,
-}
-
-impl RowParser {
-    fn new(delimiter: Delimiter) -> Self {
-        let mut alias_map: HashMap<&'static str, BTreeSet<&'static str>> = HashMap::new();
-        alias_map.insert("rsid", RSID_ALIASES.iter().cloned().collect());
-        alias_map.insert("chromosome", CHROM_ALIASES.iter().cloned().collect());
-        alias_map.insert("position", POSITION_ALIASES.iter().cloned().collect());
-        alias_map.insert("genotype", GENOTYPE_ALIASES.iter().cloned().collect());
-        alias_map.insert("allele1", ALLELE1_ALIASES.iter().cloned().collect());
-        alias_map.insert("allele2", ALLELE2_ALIASES.iter().cloned().collect());
-        alias_map.insert("gs", GS_ALIASES.iter().cloned().collect());
-        alias_map.insert("baf", BAF_ALIASES.iter().cloned().collect());
-        alias_map.insert("lrr", LRR_ALIASES.iter().cloned().collect());
-        Self {
-            delimiter,
-            header: None,
-            comment_header: None,
-            alias_map,
+    let is_indel = trimmed.contains('D')
+        || trimmed.contains('I')
+        || alternates.iter().any(|alt| alt.len() != reference.len());
+    if is_indel {
+        if let Some((a1, a2)) = map_indel_genotype(&trimmed, reference, alternates) {
+            if let Some(gt) = map_to_gt(&a1, &a2, reference, alternates) {
+                return (gt, false, true);
+            }
         }
     }
 
-    fn consume_line(&mut self, line: &str) -> Result<RowOutcome> {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return Ok(RowOutcome::Ignored);
-        }
-
-        if let Some(prefix) = COMMENT_PREFIXES
-            .iter()
-            .find(|prefix| trimmed.starts_with(**prefix))
-        {
-            let candidate = trimmed.trim_start_matches(prefix).trim();
-            if candidate.is_empty() {
-                return Ok(RowOutcome::Ignored);
-            }
-            let fields = self.parse_fields(candidate);
-            if self.looks_like_header(&fields) {
-                self.comment_header = Some(fields);
-            }
-            return Ok(RowOutcome::Ignored);
-        }
-
-        let fields = self.parse_fields(line);
-        if fields.is_empty() {
-            return Ok(RowOutcome::Ignored);
-        }
-
-        if self.header.is_none() {
-            if self.looks_like_header(&fields) {
-                self.header = Some(fields);
-                return Ok(RowOutcome::Ignored);
-            }
-
-            if let Some(header) = self.comment_header.take() {
-                self.header = Some(header);
-            } else {
-                let default_header = self.default_header(fields.len());
-                self.header = Some(default_header);
-            }
-        }
-
-        let header = self.header.as_ref().expect("header must be set");
-        let mut row_map: HashMap<String, String> = HashMap::new();
-        for (idx, value) in fields.into_iter().enumerate() {
-            if idx >= header.len() {
-                continue;
-            }
-            row_map.insert(normalize_name(&header[idx]), strip_inline_comment(&value));
-        }
-
-        let rsid = match self.lookup(&row_map, "rsid") {
-            Some(value) if !value.is_empty() => value,
-            _ => return Ok(RowOutcome::Skipped),
-        };
-        let chrom = match self.lookup(&row_map, "chromosome") {
-            Some(value) if !value.is_empty() => value,
-            _ => return Ok(RowOutcome::Skipped),
-        };
-        let pos = match self
-            .lookup(&row_map, "position")
-            .and_then(|value| value.parse::<i64>().ok())
-        {
-            Some(pos) => pos,
-            None => return Ok(RowOutcome::Skipped),
-        };
-
-        let genotype = self.lookup(&row_map, "genotype").filter(|v| !v.is_empty());
-        let allele1 = self.lookup(&row_map, "allele1").filter(|v| !v.is_empty());
-        let allele2 = self.lookup(&row_map, "allele2").filter(|v| !v.is_empty());
-        let combined_genotype = match (genotype, allele1, allele2) {
-            (Some(gt), _, _) => Some(gt),
-            (None, Some(a1), Some(a2)) => Some(format!("{}{}", a1, a2)),
-            (None, Some(a1), None) => Some(a1),
-            (None, None, Some(a2)) => Some(a2),
-            (None, None, None) => None,
-        };
-
-        Ok(RowOutcome::Parsed(GenotypeRow {
-            rsid,
-            chrom,
-            pos,
-            genotype: combined_genotype,
-            gs: self.lookup(&row_map, "gs"),
-            baf: self.lookup(&row_map, "baf"),
-            lrr: self.lookup(&row_map, "lrr"),
-        }))
-    }
-
-    fn lookup(&self, row_map: &HashMap<String, String>, key: &str) -> Option<String> {
-        let aliases = self.alias_map.get(key)?;
-        for alias in aliases {
-            let normalized_key = normalize_name(alias);
-            if let Some(value) = row_map.get(&normalized_key) {
-                if !value.is_empty() {
-                    return Some(value.clone());
-                }
-            }
-        }
-        None
-    }
-
-    fn parse_fields(&self, line: &str) -> Vec<String> {
-        match self.delimiter {
-            Delimiter::Tab => line
-                .split('\t')
-                .map(|field| field.trim().to_string())
-                .collect(),
-            Delimiter::Space => line
-                .split_whitespace()
-                .map(|field| field.trim().to_string())
-                .collect(),
-            Delimiter::Comma => split_csv_line(line),
-        }
-    }
-
-    fn looks_like_header(&self, fields: &[String]) -> bool {
-        if fields.is_empty() {
-            return false;
-        }
-        let first = normalize_name(&fields[0]);
-        self.alias_map
-            .get("rsid")
-            .map(|aliases| aliases.contains(first.as_str()))
-            .unwrap_or(false)
-    }
-
-    fn default_header(&self, field_count: usize) -> Vec<String> {
-        let base = vec![
-            "rsid",
-            "chromosome",
-            "position",
-            "genotype",
-            "gs",
-            "baf",
-            "lrr",
-        ];
-        if field_count <= base.len() {
-            base[..field_count].iter().map(|s| s.to_string()).collect()
-        } else {
-            let mut header = base.into_iter().map(|s| s.to_string()).collect::<Vec<_>>();
-            for idx in 0..(field_count - header.len()) {
-                header.push(format!("extra_{}", idx));
-            }
-            header
-        }
+    let (a1, a2) = match split_genotype(&trimmed) {
+        Some(tokens) => tokens,
+        None => return ("./.".to_string(), true, false),
+    };
+    match map_to_gt(&a1, &a2, reference, alternates) {
+        Some(gt) => (gt, false, false),
+        None => ("./.".to_string(), true, false),
     }
 }
 
-fn detect_delimiter(lines: &[String]) -> Delimiter {
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty()
-            || COMMENT_PREFIXES
-                .iter()
-                .any(|prefix| trimmed.starts_with(prefix))
-        {
-            continue;
-        }
-        if line.contains('\t') {
-            return Delimiter::Tab;
-        }
-        if line.contains(',') {
-            return Delimiter::Comma;
-        }
-        let whitespace_fields = trimmed.split_whitespace().collect::<Vec<_>>();
-        if whitespace_fields.len() > 1 {
-            return Delimiter::Space;
+fn split_genotype(genotype: &str) -> Option<(String, String)> {
+    if genotype.contains('/') || genotype.contains('|') {
+        let parts: Vec<&str> = genotype.split(['/', '|']).collect();
+        if parts.len() >= 2 {
+            return Some((parts[0].to_string(), parts[1].to_string()));
         }
     }
-    Delimiter::Tab
+
+    let compact: String = genotype.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.is_empty() {
+        return None;
+    }
+    if compact.len() == 1 {
+        return Some((compact.clone(), compact));
+    }
+    if compact.len() == 2 {
+        let mut chars = compact.chars();
+        let a1 = chars.next()?.to_string();
+        let a2 = chars.next()?.to_string();
+        return Some((a1, a2));
+    }
+    let mid = compact.len() / 2;
+    Some((compact[..mid].to_string(), compact[mid..].to_string()))
 }
 
-fn split_csv_line(line: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut chars = line.chars().peekable();
+fn map_to_gt(
+    allele1: &str,
+    allele2: &str,
+    reference: &str,
+    alternates: &[String],
+) -> Option<String> {
+    let idx1 = allele_index(allele1, reference, alternates)?;
+    let idx2 = allele_index(allele2, reference, alternates)?;
+    let min = idx1.min(idx2);
+    let max = idx1.max(idx2);
+    Some(format!("{}/{}", min, max))
+}
 
-    while let Some(ch) = chars.next() {
+fn allele_index(allele: &str, reference: &str, alternates: &[String]) -> Option<usize> {
+    if allele == reference {
+        return Some(0);
+    }
+    alternates
+        .iter()
+        .position(|alt| alt == allele)
+        .map(|idx| idx + 1)
+}
+
+fn map_indel_genotype(
+    genotype: &str,
+    reference: &str,
+    alternates: &[String],
+) -> Option<(String, String)> {
+    if !genotype.contains('D') && !genotype.contains('I') {
+        return None;
+    }
+    let mut candidates = Vec::with_capacity(alternates.len() + 1);
+    candidates.push(reference.to_string());
+    candidates.extend_from_slice(alternates);
+    candidates.sort_by_key(|value| value.len());
+    let allele_d = candidates.first()?.clone();
+    let allele_i = candidates.last()?.clone();
+    if allele_d.len() == allele_i.len() {
+        return None;
+    }
+
+    let mut mapped = Vec::new();
+    for ch in genotype.chars() {
         match ch {
-            '"' => {
-                if in_quotes && chars.peek() == Some(&'"') {
-                    current.push('"');
-                    chars.next();
-                } else {
-                    in_quotes = !in_quotes;
-                }
-            }
-            ',' if !in_quotes => {
-                fields.push(current.trim().to_string());
-                current.clear();
-            }
-            _ => current.push(ch),
+            'D' => mapped.push(allele_d.clone()),
+            'I' => mapped.push(allele_i.clone()),
+            _ => return None,
         }
     }
-
-    fields.push(current.trim().to_string());
-
-    fields
-}
-
-fn normalize_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| !matches!(c, ' ' | '\t' | '-' | '_'))
-        .flat_map(|c| c.to_lowercase())
-        .collect()
-}
-
-fn strip_inline_comment(value: &str) -> String {
-    let mut trimmed = value.trim();
-    if let Some(idx) = trimmed.find('#') {
-        trimmed = &trimmed[..idx];
-    }
-    if let Some(idx) = trimmed.find("//") {
-        trimmed = &trimmed[..idx];
-    }
-    trimmed.trim().to_string()
-}
-
-fn parse_genotype_alleles(raw: &str) -> Option<(String, String)> {
-    if is_missing_genotype(raw) {
-        return None;
-    }
-    let trimmed = raw.trim();
-    if trimmed.contains('/') || trimmed.contains('|') {
-        let parts: Vec<&str> = trimmed.split(['/', '|']).collect();
-        if parts.len() == 2 {
-            let a1 = normalize_allele(parts[0])?;
-            let a2 = normalize_allele(parts[1])?;
-            return Some((a1, a2));
-        }
-    }
-
-    let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
-    let mut chars = compact.chars();
-    let first = chars.next()?;
-    let second = chars.next().unwrap_or(first);
-    let a1 = normalize_allele(&first.to_string())?;
-    let a2 = normalize_allele(&second.to_string())?;
-    Some((a1, a2))
-}
-
-fn normalize_allele(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let upper = trimmed.to_ascii_uppercase();
-    if upper == "I" || upper == "D" {
-        return Some(upper);
-    }
-    if upper.chars().all(|c| matches!(c, 'A' | 'C' | 'G' | 'T')) {
-        return Some(upper);
+    if mapped.len() >= 2 {
+        return Some((mapped[0].clone(), mapped[1].clone()));
     }
     None
-}
-
-fn is_missing_genotype(raw: &str) -> bool {
-    let trimmed = raw.trim().to_ascii_uppercase();
-    if trimmed.is_empty() {
-        return true;
-    }
-    if matches!(trimmed.as_str(), "." | "./." | ".|." | "NA" | "N/A") {
-        return true;
-    }
-    trimmed
-        .chars()
-        .all(|c| matches!(c, 'N' | '-' | '0' | '.' | '/' | '|'))
-}
-
-fn normalize_sequence(value: &str) -> String {
-    value.trim().to_ascii_uppercase()
 }
 
 fn parse_alternates(alternates: &str) -> Vec<String> {
@@ -795,155 +681,15 @@ fn parse_alternates(alternates: &str) -> Vec<String> {
     results
 }
 
-fn append_observed_alt(alts: &mut Vec<String>, reference: &str, allele: &str) {
-    if allele == "I" || allele == "D" {
-        return;
-    }
-    if allele == reference {
-        return;
-    }
-    if !alts.iter().any(|alt| alt == allele) {
-        alts.push(allele.to_string());
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum VariantKind {
-    Snp,
-    Mnv,
-    Insertion,
-    Deletion,
-    Mixed,
-    Unknown,
-}
-
-fn classify_variant(reference: &str, alts: &[String]) -> VariantKind {
-    if alts.is_empty() {
-        return VariantKind::Unknown;
-    }
-    let ref_len = reference.len();
-    let mut longer = false;
-    let mut shorter = false;
-    let mut equal = false;
-    for alt in alts {
-        match alt.len().cmp(&ref_len) {
-            std::cmp::Ordering::Greater => longer = true,
-            std::cmp::Ordering::Less => shorter = true,
-            std::cmp::Ordering::Equal => equal = true,
-        }
-    }
-    let flags = longer as u8 + shorter as u8 + equal as u8;
-    if flags > 1 {
-        return VariantKind::Mixed;
-    }
-    if longer {
-        return VariantKind::Insertion;
-    }
-    if shorter {
-        return VariantKind::Deletion;
-    }
-    if ref_len == 1 {
-        VariantKind::Snp
-    } else {
-        VariantKind::Mnv
-    }
-}
-
-fn map_allele_index(
-    allele: &str,
-    reference: &str,
-    alts: &[String],
-    kind: VariantKind,
-) -> Option<usize> {
-    if allele == reference {
-        return Some(0);
-    }
-    if allele == "I" || allele == "D" {
-        return map_indel_symbol(allele, reference, alts, kind);
-    }
-    alts.iter().position(|alt| alt == allele).map(|idx| idx + 1)
-}
-
-fn map_indel_symbol(
-    symbol: &str,
-    reference: &str,
-    alts: &[String],
-    kind: VariantKind,
-) -> Option<usize> {
-    let ref_len = reference.len();
-    match kind {
-        VariantKind::Insertion => {
-            if symbol == "D" {
-                return Some(0);
-            }
-            alts.iter()
-                .position(|alt| alt.len() > ref_len)
-                .map(|idx| idx + 1)
-        }
-        VariantKind::Deletion => {
-            if symbol == "I" {
-                return Some(0);
-            }
-            alts.iter()
-                .position(|alt| alt.len() < ref_len)
-                .map(|idx| idx + 1)
-        }
-        _ => None,
-    }
-}
-
-fn strip_rsid_prefix(value: &str) -> &str {
-    match value.get(0..2) {
-        Some(prefix) if prefix.eq_ignore_ascii_case("rs") => &value[2..],
-        _ => value,
-    }
+fn normalize_sequence(value: &str) -> String {
+    value.trim().to_ascii_uppercase()
 }
 
 fn load_reference_map(store: &StatsStore) -> Result<HashMap<i64, ReferenceVariant>> {
-    let references = store.all_references(None)?;
+    let references = store.all_references_with_overrides()?;
     let mut map = HashMap::with_capacity(references.len());
     for reference in references {
         map.insert(reference.rsid, reference);
     }
     Ok(map)
-}
-
-fn collect_contigs(rows: &[GenotypeRow]) -> Vec<String> {
-    let mut set = BTreeSet::new();
-    for row in rows {
-        let contig = row.chrom.trim();
-        if !contig.is_empty() {
-            set.insert(contig.to_string());
-        }
-    }
-    let mut contigs: Vec<String> = set.into_iter().collect();
-    contigs.sort_by(|a, b| compare_contigs(a, b));
-    contigs
-}
-
-fn compare_contigs(a: &str, b: &str) -> std::cmp::Ordering {
-    let a_key = contig_sort_key(a);
-    let b_key = contig_sort_key(b);
-    a_key
-        .0
-        .cmp(&b_key.0)
-        .then_with(|| a_key.1.cmp(&b_key.1))
-        .then_with(|| a.cmp(b))
-}
-
-fn contig_sort_key(value: &str) -> (u8, u32) {
-    let trimmed = value.trim();
-    let normalized = trimmed
-        .strip_prefix("chr")
-        .or_else(|| trimmed.strip_prefix("CHR"));
-    let core = normalized.unwrap_or(trimmed);
-    if let Ok(num) = core.parse::<u32>() {
-        return (0, num);
-    }
-    match core.to_ascii_uppercase().as_str() {
-        "X" => (1, 23),
-        "Y" => (1, 24),
-        "MT" | "M" => (1, 25),
-        _ => (2, 0),
-    }
 }

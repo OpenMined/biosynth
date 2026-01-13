@@ -1,0 +1,23 @@
+.git
+.github
+**/.DS_Store
+**/*.sqlite
+**/*.sqlite.bak
+**/*.ipynb
+**/*.csv
+**/*.tsv
+**/*.txt
+**/*.json
+out/
+notebooks/
+data/
+
+# Allow the cached DB we explicitly copy
+!data/genostats.sqlite
+
+# Allow source needed for build
+!cli/Cargo.toml
+!cli/Cargo.lock
+!cli/src/**
+!docker/**
+!overlay_variants.json
