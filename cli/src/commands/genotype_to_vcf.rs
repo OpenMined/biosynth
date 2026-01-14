@@ -42,7 +42,7 @@ pub fn run_genotype_to_vcf(args: GenotypeToVcfArgs) -> Result<()> {
         bail!("--missing-log can only be used with a single input file");
     }
 
-    let sqlite_path = ensure_reference_db(Some(&args.sqlite))?;
+    let sqlite_path = ensure_reference_db(Some(&args.sqlite), args.force_download)?;
     let store = StatsStore::connect(&sqlite_path)?;
     let reference_map = load_reference_map(&store)?;
 

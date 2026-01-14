@@ -14,7 +14,7 @@ pub fn run_allele_report(args: AlleleReportArgs) -> Result<()> {
         anyhow::bail!("--output must include a filename (e.g. report.html)");
     }
 
-    let sqlite_path = ensure_reference_db(Some(&args.sqlite))?;
+    let sqlite_path = ensure_reference_db(Some(&args.sqlite), args.force_download)?;
     let store = StatsStore::connect(&sqlite_path)?;
     let conn = store.open_connection()?;
     let summary = FormatSummary::gather(&conn)?;

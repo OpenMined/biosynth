@@ -88,6 +88,9 @@ pub struct AlleleReportArgs {
     /// Path to the SQLite database created by `bvs genostats` (uses data/genostats.sqlite in production).
     #[arg(long, default_value = "data/genostats.sqlite")]
     pub sqlite: PathBuf,
+    /// Force re-download of the reference database.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub force_download: bool,
     /// Output path for the generated HTML report.
     #[arg(long)]
     pub output: PathBuf,
@@ -111,6 +114,9 @@ pub struct GenotypeToVcfArgs {
     /// Path to the SQLite database containing rsid_reference data.
     #[arg(long, default_value = "data/genostats.sqlite")]
     pub sqlite: PathBuf,
+    /// Force re-download of the reference database.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub force_download: bool,
     /// Output VCF path (single input only; defaults to <input>.vcf or <input>.vcf.gz).
     #[arg(long)]
     pub output: Option<PathBuf>,
@@ -212,6 +218,9 @@ pub struct SyntheticArgs {
     /// Path to the SQLite database containing rsid_reference data (uses data/genostats.sqlite in production).
     #[arg(long, default_value = "data/genostats.sqlite")]
     pub sqlite: PathBuf,
+    /// Force re-download of the reference database.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub force_download: bool,
     /// Output file to write
     #[arg(long)]
     pub output: PathBuf,
