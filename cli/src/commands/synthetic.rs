@@ -65,7 +65,7 @@ pub fn run_synthetic(args: SyntheticArgs) -> Result<()> {
         bail!("Day range must be between 1 and 31");
     }
 
-    let sqlite_path = ensure_reference_db(Some(&args.sqlite))?;
+    let sqlite_path = ensure_reference_db(Some(&args.sqlite), args.force_download)?;
     let store = StatsStore::connect(&sqlite_path)?;
     let references = store.all_references(args.limit)?;
     if references.is_empty() {

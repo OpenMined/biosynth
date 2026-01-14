@@ -8,13 +8,28 @@ use reqwest::blocking::Client;
 const GITHUB_RAW_BASE: &str = "https://raw.githubusercontent.com/openmined/biosynth/main";
 const DATA_DIR: &str = "data";
 
-pub fn ensure_reference_db(custom_path: Option<&PathBuf>) -> Result<PathBuf> {
+pub fn ensure_reference_db(custom_path: Option<&PathBuf>, force_download: bool) -> Result<PathBuf> {
     let data_dir = PathBuf::from(DATA_DIR);
     let data_db_path = data_dir.join("genostats.sqlite");
+    let baked_in_db_path = PathBuf::from("/app/data/genostats.sqlite");
+
+    if force_download {
+        if !data_dir.exists() {
+            fs::create_dir_all(&data_dir)
+                .with_context(|| format!("Create data directory {:?}", data_dir))?;
+        }
+        println!("📥 Downloading reference database from GitHub...");
+        download_file("data/genostats.sqlite", &data_db_path)?;
+        println!("✅ Downloaded to {:?}", data_db_path);
+        return Ok(data_db_path);
+    }
 
     if let Some(path) = custom_path {
         if path.exists() {
             return Ok(path.clone());
+        }
+        if !path.is_absolute() && baked_in_db_path.exists() {
+            return Ok(baked_in_db_path);
         }
     }
 
@@ -22,10 +37,20 @@ pub fn ensure_reference_db(custom_path: Option<&PathBuf>) -> Result<PathBuf> {
         if data_db_path.exists() {
             return Ok(data_db_path);
         }
+        if baked_in_db_path.exists() {
+            return Ok(baked_in_db_path);
+        }
         if let Some(path) = custom_path {
             return Ok(path.clone());
         }
         return Ok(PathBuf::from("genostats.sqlite"));
+    }
+
+    if data_db_path.exists() {
+        return Ok(data_db_path);
+    }
+    if baked_in_db_path.exists() {
+        return Ok(baked_in_db_path);
     }
 
     if !data_dir.exists() {
