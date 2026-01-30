@@ -47,6 +47,12 @@ pub fn run_synthetic(args: SyntheticArgs) -> Result<()> {
     if !(0.0..=1.0).contains(&args.alt_frequency) {
         bail!("--alt-frequency must be between 0 and 1");
     }
+    if !(0.0..=1.0).contains(&args.no_call_frequency) {
+        bail!("--no-call-frequency must be between 0 and 1");
+    }
+    if args.no_call_token.trim().is_empty() {
+        bail!("--no-call-token must be non-empty");
+    }
     if args.count == 0 {
         bail!("--count must be at least 1");
     }
@@ -99,6 +105,8 @@ pub fn run_synthetic(args: SyntheticArgs) -> Result<()> {
                     references.as_ref(),
                     overlays.as_ref(),
                     args.alt_frequency,
+                    args.no_call_frequency,
+                    args.no_call_token.as_str(),
                     plan.seed,
                 )
             })
@@ -120,6 +128,8 @@ fn write_single_file(
     references: &[ReferenceVariant],
     overlays: &[OverlaySpec],
     alt_frequency: f64,
+    no_call_frequency: f64,
+    no_call_token: &str,
     seed: Option<u64>,
 ) -> Result<usize> {
     if let Some(parent) = path.parent() {
@@ -132,8 +142,10 @@ fn write_single_file(
         Some(seed) => StdRng::seed_from_u64(seed),
         None => StdRng::from_entropy(),
     };
+    let default_frequencies = GenotypeFrequencies::from_alt_frequency(alt_frequency)?;
 
-    let mut overlay_assignments = prepare_overlay_assignments(overlays, &mut rng)?;
+    let mut overlay_assignments =
+        prepare_overlay_assignments(overlays, default_frequencies, &mut rng)?;
 
     let file = File::create(path).with_context(|| format!("Create {:?}", path))?;
     let mut writer = BufWriter::new(file);
@@ -144,27 +156,53 @@ fn write_single_file(
     let mut written = 0usize;
     for reference in references {
         if let Some(assignment) = overlay_assignments.remove(&reference.rsid) {
-            write_overlay_row(&mut writer, &assignment, &mut rng)?;
+            let genotype = apply_no_call(
+                &assignment.genotype,
+                no_call_frequency,
+                no_call_token,
+                &mut rng,
+            );
+            write_genotype_row(
+                &mut writer,
+                &format!("rs{}", assignment.spec.rsid),
+                &assignment.spec.chromosome,
+                assignment.spec.position,
+                &genotype,
+                &mut rng,
+            )?;
             written += 1;
             continue;
         }
 
-        let genotype = synthesize_genotype(reference, alt_frequency, &mut rng);
-        let gs = rng.gen_range(0.2..=1.0);
-        let baf = rng.gen_range(0.0..=1.0);
-        let lrr = rng.gen_range(-0.5..=0.5);
-        let rsid_label = format!("rs{}", reference.rsid);
-        writeln!(
-            writer,
-            "{}\t{}\t{}\t{}\t{:.4}\t{:.3}\t{:.4}",
-            rsid_label, reference.chromosome, reference.position, genotype, gs, baf, lrr
+        let genotype = synthesize_genotype(reference, &default_frequencies, &mut rng);
+        let genotype = apply_no_call(&genotype, no_call_frequency, no_call_token, &mut rng);
+        write_genotype_row(
+            &mut writer,
+            &format!("rs{}", reference.rsid),
+            &reference.chromosome,
+            reference.position,
+            &genotype,
+            &mut rng,
         )
         .with_context(|| format!("write row for rs{}", reference.rsid))?;
         written += 1;
     }
 
     for assignment in overlay_assignments.into_values() {
-        write_overlay_row(&mut writer, &assignment, &mut rng)?;
+        let genotype = apply_no_call(
+            &assignment.genotype,
+            no_call_frequency,
+            no_call_token,
+            &mut rng,
+        );
+        write_genotype_row(
+            &mut writer,
+            &format!("rs{}", assignment.spec.rsid),
+            &assignment.spec.chromosome,
+            assignment.spec.position,
+            &genotype,
+            &mut rng,
+        )?;
         written += 1;
     }
 
@@ -172,27 +210,23 @@ fn write_single_file(
     Ok(written)
 }
 
-fn write_overlay_row(
+fn write_genotype_row(
     writer: &mut BufWriter<File>,
-    assignment: &OverlayAssignment,
+    rsid_label: &str,
+    chromosome: &str,
+    position: i64,
+    genotype: &str,
     rng: &mut StdRng,
 ) -> Result<()> {
     let gs = rng.gen_range(0.2..=1.0);
     let baf = rng.gen_range(0.0..=1.0);
     let lrr = rng.gen_range(-0.5..=0.5);
-    let rsid_label = format!("rs{}", assignment.spec.rsid);
     writeln!(
         writer,
         "{}\t{}\t{}\t{}\t{:.4}\t{:.3}\t{:.4}",
-        rsid_label,
-        assignment.spec.chromosome,
-        assignment.spec.position,
-        assignment.genotype,
-        gs,
-        baf,
-        lrr
+        rsid_label, chromosome, position, genotype, gs, baf, lrr
     )
-    .with_context(|| format!("write overlay row for {}", assignment.spec.rsid))
+    .with_context(|| format!("write row for {}", rsid_label))
 }
 
 fn load_overlay_specs(args: &SyntheticArgs) -> Result<Option<Vec<OverlaySpec>>> {
@@ -225,11 +259,12 @@ fn load_overlay_specs(args: &SyntheticArgs) -> Result<Option<Vec<OverlaySpec>>> 
 
 fn prepare_overlay_assignments(
     overlays: &[OverlaySpec],
+    default_frequencies: GenotypeFrequencies,
     rng: &mut StdRng,
 ) -> Result<HashMap<i64, OverlayAssignment>> {
     let mut assignments: HashMap<i64, OverlayAssignment> = HashMap::new();
     for spec in overlays {
-        let genotype = spec.random_genotype(rng)?;
+        let genotype = spec.random_genotype(default_frequencies, rng)?;
         if assignments
             .insert(
                 spec.rsid,
@@ -252,6 +287,9 @@ struct OverlaySpec {
     chromosome: String,
     position: i64,
     genotype_options: Vec<String>,
+    reference: Option<String>,
+    alternates: Vec<String>,
+    genotype_frequencies: Option<GenotypeFrequenciesRaw>,
 }
 
 impl OverlaySpec {
@@ -267,17 +305,25 @@ impl OverlaySpec {
                 bail!("Variant {} has empty genotype list", raw.rsid);
             }
             options.clone()
-        } else if let Some(reference) = &raw.reference {
-            let alternates = raw
-                .alternates
-                .clone()
-                .unwrap_or_else(|| vec![reference.clone()]);
-            generate_genotype_combinations(reference, &alternates)
         } else {
-            bail!(
-                "Variant {} must specify either genotypes or reference/alternates",
-                raw.rsid
-            );
+            Vec::new()
+        };
+
+        let (reference, alternates, genotype_frequencies) = if genotype_options.is_empty() {
+            let Some(reference) = &raw.reference else {
+                bail!(
+                    "Variant {} must specify either genotypes or reference/alternates",
+                    raw.rsid
+                );
+            };
+            let alternates = raw.alternates.clone().unwrap_or_default();
+            (
+                Some(reference.clone()),
+                alternates,
+                raw.genotype_frequencies,
+            )
+        } else {
+            (None, Vec::new(), None)
         };
 
         Ok(Self {
@@ -285,12 +331,31 @@ impl OverlaySpec {
             chromosome: raw.chromosome.clone(),
             position: raw.position,
             genotype_options,
+            reference,
+            alternates,
+            genotype_frequencies,
         })
     }
 
-    fn random_genotype(&self, rng: &mut StdRng) -> Result<String> {
+    fn random_genotype(
+        &self,
+        default_frequencies: GenotypeFrequencies,
+        rng: &mut StdRng,
+    ) -> Result<String> {
         if self.genotype_options.is_empty() {
-            bail!("Variant {} has no genotype options", self.rsid);
+            let Some(reference) = &self.reference else {
+                bail!("Variant {} has no genotype options", self.rsid);
+            };
+            let frequencies = match &self.genotype_frequencies {
+                Some(raw) => parse_frequencies(raw)?,
+                None => default_frequencies,
+            };
+            return Ok(synthesize_genotype_from_parts(
+                reference,
+                &self.alternates,
+                &frequencies,
+                rng,
+            ));
         }
         let idx = rng.gen_range(0..self.genotype_options.len());
         Ok(self.genotype_options[idx].clone())
@@ -428,75 +493,179 @@ struct OverlayVariantRaw {
     genotypes: Option<Vec<String>>,
     reference: Option<String>,
     alternates: Option<Vec<String>>,
-}
-
-fn generate_genotype_combinations(reference: &str, alternates: &[String]) -> Vec<String> {
-    let mut alleles = Vec::new();
-    alleles.push(reference.to_string());
-    for alt in alternates {
-        if !alt.is_empty() {
-            alleles.push(alt.clone());
-        }
-    }
-    alleles.sort();
-    alleles.dedup();
-
-    let mut combos = Vec::new();
-    for i in 0..alleles.len() {
-        for j in i..alleles.len() {
-            let combo = format!("{}{}", alleles[i], alleles[j]);
-            combos.push(combo);
-        }
-    }
-    combos
+    #[serde(default)]
+    genotype_frequencies: Option<GenotypeFrequenciesRaw>,
 }
 
 fn synthesize_genotype(
     reference: &ReferenceVariant,
-    alt_frequency: f64,
+    default_frequencies: &GenotypeFrequencies,
     rng: &mut StdRng,
 ) -> String {
-    let alt_list = reference
-        .alternates
+    let alt_list = parse_alternates(&reference.alternates);
+    synthesize_genotype_from_parts(&reference.reference, &alt_list, default_frequencies, rng)
+}
+
+fn parse_frequencies(raw: &GenotypeFrequenciesRaw) -> Result<GenotypeFrequencies> {
+    GenotypeFrequencies::from_parts(raw.het, raw.hom_alt)
+}
+
+fn parse_alternates(alternates: &str) -> Vec<String> {
+    alternates
         .split(',')
         .map(|alt| alt.trim())
         .filter(|alt| !alt.is_empty())
+        .map(|alt| alt.to_string())
+        .collect()
+}
+
+fn synthesize_genotype_from_parts(
+    reference: &str,
+    alternates: &[String],
+    frequencies: &GenotypeFrequencies,
+    rng: &mut StdRng,
+) -> String {
+    let alt_list = alternates
+        .iter()
+        .map(|alt| alt.as_str())
+        .filter(|alt| !alt.is_empty())
         .collect::<Vec<_>>();
     let kind = determine_variant_kind(reference, &alt_list);
-    let use_alt = !alt_list.is_empty() && rng.gen::<f64>() < alt_frequency;
 
-    match kind {
-        VariantKind::Snp | VariantKind::Mnv => {
-            let allele = if use_alt {
-                alt_list[rng.gen_range(0..alt_list.len())]
-            } else {
-                reference.reference.as_str()
-            };
-            let symbol = match kind {
-                VariantKind::Snp => allele.to_string(),
-                VariantKind::Mnv => allele
-                    .chars()
-                    .next()
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "?".into()),
-                _ => unreachable!(),
-            };
-            format!("{symbol}{symbol}")
+    let (genotype_kind, has_alt) = select_genotype_kind(frequencies, !alt_list.is_empty(), rng);
+    if !has_alt {
+        return homozygous_symbol(reference, None, kind, true);
+    }
+
+    match genotype_kind {
+        GenotypeKind::HomRef => homozygous_symbol(reference, None, kind, true),
+        GenotypeKind::HomAlt => {
+            let alt = alt_list[rng.gen_range(0..alt_list.len())];
+            homozygous_symbol(reference, Some(alt), kind, false)
         }
-        VariantKind::Insertion | VariantKind::Deletion => {
-            let (ref_symbol, alt_symbol) = match kind {
-                VariantKind::Insertion => ("D", "I"),
-                VariantKind::Deletion => ("I", "D"),
-                _ => unreachable!(),
-            };
-            let symbol = if use_alt { alt_symbol } else { ref_symbol };
-            format!("{symbol}{symbol}")
+        GenotypeKind::Het => {
+            let alt = alt_list[rng.gen_range(0..alt_list.len())];
+            heterozygous_symbol(reference, alt, kind, rng)
         }
     }
 }
 
-fn determine_variant_kind(reference: &ReferenceVariant, alts: &[&str]) -> VariantKind {
-    let ref_len = reference.reference.len();
+fn select_genotype_kind(
+    frequencies: &GenotypeFrequencies,
+    has_alt: bool,
+    rng: &mut StdRng,
+) -> (GenotypeKind, bool) {
+    if !has_alt {
+        return (GenotypeKind::HomRef, false);
+    }
+    let roll = rng.gen::<f64>();
+    let hom_alt_threshold = frequencies.hom_ref + frequencies.het + frequencies.hom_alt;
+    let kind = if roll < frequencies.hom_ref {
+        GenotypeKind::HomRef
+    } else if roll < frequencies.hom_ref + frequencies.het {
+        GenotypeKind::Het
+    } else if roll < hom_alt_threshold {
+        GenotypeKind::HomAlt
+    } else {
+        GenotypeKind::HomRef
+    };
+    (kind, true)
+}
+
+fn homozygous_symbol(
+    reference: &str,
+    alternate: Option<&str>,
+    kind: VariantKind,
+    use_reference: bool,
+) -> String {
+    let symbol = match kind {
+        VariantKind::Snp => {
+            if use_reference {
+                reference.to_string()
+            } else {
+                alternate.unwrap_or(reference).to_string()
+            }
+        }
+        VariantKind::Mnv => {
+            let allele = if use_reference {
+                reference
+            } else {
+                alternate.unwrap_or(reference)
+            };
+            allele
+                .chars()
+                .next()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".into())
+        }
+        VariantKind::Insertion => {
+            if use_reference {
+                "D".into()
+            } else {
+                "I".into()
+            }
+        }
+        VariantKind::Deletion => {
+            if use_reference {
+                "I".into()
+            } else {
+                "D".into()
+            }
+        }
+    };
+    format!("{symbol}{symbol}")
+}
+
+fn heterozygous_symbol(
+    reference: &str,
+    alternate: &str,
+    kind: VariantKind,
+    rng: &mut StdRng,
+) -> String {
+    let (ref_symbol, alt_symbol) = match kind {
+        VariantKind::Snp => (reference.to_string(), alternate.to_string()),
+        VariantKind::Mnv => (
+            reference
+                .chars()
+                .next()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".into()),
+            alternate
+                .chars()
+                .next()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "?".into()),
+        ),
+        VariantKind::Insertion => ("D".into(), "I".into()),
+        VariantKind::Deletion => ("I".into(), "D".into()),
+    };
+
+    if rng.gen::<bool>() {
+        format!("{ref_symbol}{alt_symbol}")
+    } else {
+        format!("{alt_symbol}{ref_symbol}")
+    }
+}
+
+fn apply_no_call(
+    genotype: &str,
+    no_call_frequency: f64,
+    no_call_token: &str,
+    rng: &mut StdRng,
+) -> String {
+    if no_call_frequency > 0.0 && rng.gen::<f64>() < no_call_frequency {
+        if no_call_token.len() == 1 {
+            format!("{0}{0}", no_call_token)
+        } else {
+            no_call_token.to_string()
+        }
+    } else {
+        genotype.to_string()
+    }
+}
+
+fn determine_variant_kind(reference: &str, alts: &[&str]) -> VariantKind {
+    let ref_len = reference.len();
     if alts.is_empty() {
         return VariantKind::Snp;
     }
@@ -514,4 +683,48 @@ fn determine_variant_kind(reference: &ReferenceVariant, alts: &[&str]) -> Varian
     } else {
         VariantKind::Mnv
     }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+struct GenotypeFrequenciesRaw {
+    het: f64,
+    hom_alt: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GenotypeFrequencies {
+    hom_ref: f64,
+    het: f64,
+    hom_alt: f64,
+}
+
+impl GenotypeFrequencies {
+    fn from_alt_frequency(alt_frequency: f64) -> Result<Self> {
+        Self::from_parts(0.0, alt_frequency)
+    }
+
+    fn from_parts(het: f64, hom_alt: f64) -> Result<Self> {
+        if !(0.0..=1.0).contains(&het) {
+            bail!("het frequency must be between 0 and 1");
+        }
+        if !(0.0..=1.0).contains(&hom_alt) {
+            bail!("hom_alt frequency must be between 0 and 1");
+        }
+        let hom_ref = 1.0 - het - hom_alt;
+        if hom_ref < 0.0 {
+            bail!("het + hom_alt must be <= 1.0");
+        }
+        Ok(Self {
+            hom_ref,
+            het,
+            hom_alt,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GenotypeKind {
+    HomRef,
+    Het,
+    HomAlt,
 }

@@ -227,6 +227,12 @@ pub struct SyntheticArgs {
     /// Probability of substituting a random ALT allele instead of the reference.
     #[arg(long, default_value = "0.01")]
     pub alt_frequency: f64,
+    /// Probability of emitting a no-call genotype ("--") for a row.
+    #[arg(long, default_value = "0.0")]
+    pub no_call_frequency: f64,
+    /// Genotype token used for no-call rows (e.g. "--" or ".").
+    #[arg(long, default_value = "--")]
+    pub no_call_token: String,
     /// Optional RNG seed for reproducible output.
     #[arg(long)]
     pub seed: Option<u64>,
