@@ -261,6 +261,35 @@ jobs:
         uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          release_name: Release v${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          body: |
+            # Biosynth v${{ steps.version.outputs.version }}
+
+            ## Installation
+
+            ### Using curl (macOS/Linux)
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+            ```
+
+            ### Using Cargo
+            ```bash
+            cargo install biosynth
+            ```
+
+      - name: Upload Release Assets
+        run: |
+          for file in artifacts/*/*.{tar.gz,zip}; do
+            if [ -f "$file" ]; then
+              gh release upload v${{ steps.version.outputs.version }} "$file" --repo ${{ github.repository }}
+            fi
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-docker:
     name: Publish Docker image
@@ -310,32 +339,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          release_name: Release v${{ steps.version.outputs.version }}
-          draft: false
-          prerelease: false
-          body: |
-            # Biosynth v${{ steps.version.outputs.version }}
-
-            ## Installation
-
-            ### Using curl (macOS/Linux)
-            ```bash
-            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
-            ```
-
-            ### Using Cargo
-            ```bash
-            cargo install biosynth
-            ```
-
-      - name: Upload Release Assets
-        run: |
-          for file in artifacts/*/*.{tar.gz,zip}; do
-            if [ -f "$file" ]; then
-              gh release upload v${{ steps.version.outputs.version }} "$file" --repo ${{ github.repository }}
-            fi
-          done
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
