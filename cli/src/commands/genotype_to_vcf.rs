@@ -42,7 +42,7 @@ pub fn run_genotype_to_vcf(args: GenotypeToVcfArgs) -> Result<()> {
         bail!("--missing-log can only be used with a single input file");
     }
 
-    let sqlite_path = ensure_reference_db(Some(&args.sqlite), args.force_download)?;
+    let sqlite_path = resolve_sqlite_path(&args)?;
     let store = if read_only_db_requested() {
         StatsStore::connect_read_only(&sqlite_path)?
     } else {
@@ -108,6 +108,16 @@ fn read_only_db_requested() -> bool {
         ),
         Err(_) => false,
     }
+}
+
+fn resolve_sqlite_path(args: &GenotypeToVcfArgs) -> Result<PathBuf> {
+    if read_only_db_requested() {
+        let baked_in = PathBuf::from("/app/data/genostats.sqlite");
+        if baked_in.exists() {
+            return Ok(baked_in);
+        }
+    }
+    ensure_reference_db(Some(&args.sqlite), args.force_download)
 }
 
 fn convert_file(
