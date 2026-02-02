@@ -292,10 +292,19 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-docker:
-    name: Publish Docker image
-    runs-on: ubuntu-latest
+    name: Publish Docker image (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     needs: [build, publish-crate]
     if: needs.build.result == 'success'
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -304,9 +313,6 @@ jobs:
       - name: Read version
         id: version
         run: echo "version=$(grep '^version = ' cli/Cargo.toml | head -n1 | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -318,24 +324,50 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/openmined/biosynth
-          tags: |
-            type=raw,value=latest
-            type=raw,value=${{ steps.version.outputs.version }}
-            type=sha
-
-      - name: Build and push
+      - name: Build and push (${{ matrix.platform }})
         uses: docker/build-push-action@v5
         with:
           context: .
           file: docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ghcr.io/openmined/biosynth:${{ steps.version.outputs.version }}-${{ matrix.arch }}
+            ghcr.io/openmined/biosynth:latest-${{ matrix.arch }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  publish-docker-manifest:
+    name: Publish Docker manifest
+    runs-on: ubuntu-latest
+    needs: [publish-docker]
+    if: needs.publish-docker.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Read version
+        id: version
+        run: echo "version=$(grep '^version = ' cli/Cargo.toml | head -n1 | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/openmined/biosynth:${{ steps.version.outputs.version }} \
+            ghcr.io/openmined/biosynth:${{ steps.version.outputs.version }}-amd64 \
+            ghcr.io/openmined/biosynth:${{ steps.version.outputs.version }}-arm64
+          docker buildx imagetools create \
+            -t ghcr.io/openmined/biosynth:latest \
+            ghcr.io/openmined/biosynth:latest-amd64 \
+            ghcr.io/openmined/biosynth:latest-arm64
