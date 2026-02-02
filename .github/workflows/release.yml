@@ -312,7 +312,17 @@ jobs:
 
       - name: Read version
         id: version
-        run: echo "version=$(grep '^version = ' cli/Cargo.toml | head -n1 | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+        run: |
+          version="$(grep '^version = ' cli/Cargo.toml | head -n1 | cut -d'\"' -f2 || true)"
+          if [[ -z "${version}" ]]; then
+            tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+            version="${tag#v}"
+          fi
+          if [[ -z "${version}" ]]; then
+            echo "❌ Unable to determine version from cli/Cargo.toml or git tags" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -349,7 +359,17 @@ jobs:
 
       - name: Read version
         id: version
-        run: echo "version=$(grep '^version = ' cli/Cargo.toml | head -n1 | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+        run: |
+          version="$(grep '^version = ' cli/Cargo.toml | head -n1 | cut -d'\"' -f2 || true)"
+          if [[ -z "${version}" ]]; then
+            tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+            version="${tag#v}"
+          fi
+          if [[ -z "${version}" ]]; then
+            echo "❌ Unable to determine version from cli/Cargo.toml or git tags" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
