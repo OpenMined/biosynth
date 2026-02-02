@@ -26,6 +26,7 @@ WORKDIR /app
 COPY --from=builder /app/cli/target/release/bvs /usr/local/bin/bvs
 COPY data/genostats.sqlite /app/data/genostats.sqlite
 RUN test -s /app/data/genostats.sqlite
+ENV BVS_READ_ONLY_DB=1
 
 ENTRYPOINT ["bvs"]
 CMD ["--help"]

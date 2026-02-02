@@ -43,7 +43,11 @@ pub fn run_genotype_to_vcf(args: GenotypeToVcfArgs) -> Result<()> {
     }
 
     let sqlite_path = ensure_reference_db(Some(&args.sqlite), args.force_download)?;
-    let store = StatsStore::connect(&sqlite_path)?;
+    let store = if read_only_db_requested() {
+        StatsStore::connect_read_only(&sqlite_path)?
+    } else {
+        StatsStore::connect(&sqlite_path)?
+    };
     let reference_map = load_reference_map(&store)?;
 
     let cache_path = args.cache.clone().unwrap_or_else(default_cache_path);
@@ -94,6 +98,16 @@ pub fn run_genotype_to_vcf(args: GenotypeToVcfArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn read_only_db_requested() -> bool {
+    match std::env::var("BVS_READ_ONLY_DB") {
+        Ok(value) => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
 }
 
 fn convert_file(

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OpenFlags, Transaction};
 use serde::Serialize;
 
 use crate::genotype::{FileMetadata, ParseSummary, VariantRecord};
@@ -21,6 +21,7 @@ pub struct ReferenceVariant {
 #[derive(Debug, Clone)]
 pub struct StatsStore {
     sqlite_path: PathBuf,
+    read_only: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,13 +54,33 @@ impl StatsStore {
         init_schema(&conn)?;
         Ok(Self {
             sqlite_path: path.to_path_buf(),
+            read_only: false,
+        })
+    }
+
+    pub fn connect_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("Open database at {:?} (read-only)", path))?;
+        configure_connection_read_only(&conn)?;
+        Ok(Self {
+            sqlite_path: path.to_path_buf(),
+            read_only: true,
         })
     }
 
     pub fn open_connection(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.sqlite_path)
-            .with_context(|| format!("Open database at {:?}", self.sqlite_path))?;
-        configure_connection(&conn)?;
+        let conn = if self.read_only {
+            Connection::open_with_flags(&self.sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("Open database at {:?} (read-only)", self.sqlite_path))?
+        } else {
+            Connection::open(&self.sqlite_path)
+                .with_context(|| format!("Open database at {:?}", self.sqlite_path))?
+        };
+        if self.read_only {
+            configure_connection_read_only(&conn)?;
+        } else {
+            configure_connection(&conn)?;
+        }
         Ok(conn)
     }
 
@@ -304,5 +325,10 @@ fn seed_formats(conn: &Connection) -> Result<()> {
 fn configure_connection(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(())
+}
+
+fn configure_connection_read_only(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "query_only", "ON")?;
     Ok(())
 }

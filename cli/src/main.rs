@@ -19,6 +19,7 @@ use crate::commands::reference_load::run_reference_load;
 use crate::commands::resolve_rsids::run_resolve_rsids;
 use crate::commands::sync_rsid_cache::run_sync_rsid_cache;
 use crate::commands::synthetic::run_synthetic;
+use crate::commands::update::run_update;
 
 mod commands {
     pub mod allele_report;
@@ -30,6 +31,7 @@ mod commands {
     pub mod resolve_rsids;
     pub mod sync_rsid_cache;
     pub mod synthetic;
+    pub mod update;
 }
 
 #[derive(Parser)]
@@ -59,6 +61,8 @@ enum Commands {
     SyncRsidCache(SyncRsidCacheArgs),
     /// Generate a reference genotype file from stored data.
     Synthetic(SyntheticArgs),
+    /// Update the bvs binary from the latest GitHub release.
+    Update(UpdateArgs),
 }
 
 #[derive(Args, Clone)]
@@ -277,6 +281,16 @@ pub struct SyntheticArgs {
     pub date_format: String,
 }
 
+#[derive(Args, Clone)]
+pub struct UpdateArgs {
+    /// Specific version tag to install (e.g. v0.1.9). Defaults to latest.
+    #[arg(long)]
+    pub version: Option<String>,
+    /// Installation directory (defaults to ~/.local/bin).
+    #[arg(long)]
+    pub install_dir: Option<PathBuf>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -290,5 +304,6 @@ fn main() -> Result<()> {
         Commands::ReferenceLoad(args) => run_reference_load(args),
         Commands::SyncRsidCache(args) => run_sync_rsid_cache(args),
         Commands::Synthetic(args) => run_synthetic(args),
+        Commands::Update(args) => run_update(args),
     }
 }
