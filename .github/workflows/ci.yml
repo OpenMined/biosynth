@@ -82,9 +82,19 @@ jobs:
           mkdir -p out
           docker run --rm --read-only \
             --tmpfs /tmp:rw,exec,mode=1777 \
-            -v "${{ github.workspace }}/test_data:/data:ro" \
+            -e BVS_READ_ONLY_DB=1 \
+            -v "${{ github.workspace }}/out:/out" \
+            biosynth:ci \
+            synthetic \
+            --output /out/genotypes/{index}.txt \
+            --count 1 \
+            --seed 42
+
+          docker run --rm --read-only \
+            --tmpfs /tmp:rw,exec,mode=1777 \
+            -e BVS_READ_ONLY_DB=1 \
             -v "${{ github.workspace }}/out:/out" \
             biosynth:ci \
             genotype-to-vcf \
-            --input /data/274939/274939_X_X_GSAv3-DTC_GRCh38-12-06-2025.txt \
+            --input /out/genotypes/0001.txt \
             --output /out/out.vcf
