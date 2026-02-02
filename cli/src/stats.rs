@@ -59,8 +59,7 @@ impl StatsStore {
     }
 
     pub fn connect_read_only(path: &Path) -> Result<Self> {
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| format!("Open database at {:?} (read-only)", path))?;
+        let conn = open_read_only_connection(path)?;
         configure_connection_read_only(&conn)?;
         Ok(Self {
             sqlite_path: path.to_path_buf(),
@@ -70,8 +69,7 @@ impl StatsStore {
 
     pub fn open_connection(&self) -> Result<Connection> {
         let conn = if self.read_only {
-            Connection::open_with_flags(&self.sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .with_context(|| format!("Open database at {:?} (read-only)", self.sqlite_path))?
+            open_read_only_connection(&self.sqlite_path)?
         } else {
             Connection::open(&self.sqlite_path)
                 .with_context(|| format!("Open database at {:?}", self.sqlite_path))?
@@ -331,4 +329,19 @@ fn configure_connection(conn: &Connection) -> Result<()> {
 fn configure_connection_read_only(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "query_only", "ON")?;
     Ok(())
+}
+
+fn open_read_only_connection(path: &Path) -> Result<Connection> {
+    let uri = read_only_uri(path);
+    Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("Open database at {:?} (read-only)", path))
+}
+
+fn read_only_uri(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let escaped = raw.replace(' ', "%20");
+    format!("file:{escaped}?immutable=1")
 }

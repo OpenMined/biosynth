@@ -67,3 +67,34 @@ jobs:
 
       - name: Build
         run: cd cli && cargo build --verbose
+
+  docker-readonly:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build image (local)
+        run: docker build -f docker/Dockerfile -t biosynth:ci .
+
+      - name: Run read-only container
+        run: |
+          mkdir -p out
+          docker run --rm --read-only \
+            --tmpfs /tmp:rw,exec,mode=1777 \
+            -e BVS_READ_ONLY_DB=1 \
+            -v "${{ github.workspace }}/out:/out" \
+            biosynth:ci \
+            synthetic \
+            --output /out/genotypes/{index}.txt \
+            --count 1 \
+            --seed 42
+
+          docker run --rm --read-only \
+            --tmpfs /tmp:rw,exec,mode=1777 \
+            -e BVS_READ_ONLY_DB=1 \
+            -v "${{ github.workspace }}/out:/out" \
+            biosynth:ci \
+            genotype-to-vcf \
+            --input /out/genotypes/0001.txt \
+            --output /out/out.vcf

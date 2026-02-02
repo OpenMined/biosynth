@@ -71,8 +71,12 @@ pub fn run_synthetic(args: SyntheticArgs) -> Result<()> {
         bail!("Day range must be between 1 and 31");
     }
 
-    let sqlite_path = ensure_reference_db(Some(&args.sqlite), args.force_download)?;
-    let store = StatsStore::connect(&sqlite_path)?;
+    let sqlite_path = resolve_sqlite_path(&args)?;
+    let store = if read_only_db_requested() {
+        StatsStore::connect_read_only(&sqlite_path)?
+    } else {
+        StatsStore::connect(&sqlite_path)?
+    };
     let references = store.all_references(args.limit)?;
     if references.is_empty() {
         bail!(
@@ -121,6 +125,26 @@ pub fn run_synthetic(args: SyntheticArgs) -> Result<()> {
         args.alt_frequency * 100.0
     );
     Ok(())
+}
+
+fn read_only_db_requested() -> bool {
+    match std::env::var("BVS_READ_ONLY_DB") {
+        Ok(value) => matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+fn resolve_sqlite_path(args: &SyntheticArgs) -> Result<PathBuf> {
+    if read_only_db_requested() {
+        let baked_in = PathBuf::from("/app/data/genostats.sqlite");
+        if baked_in.exists() {
+            return Ok(baked_in);
+        }
+    }
+    ensure_reference_db(Some(&args.sqlite), args.force_download)
 }
 
 fn write_single_file(
