@@ -250,8 +250,27 @@ fn load_overlay_specs(args: &SyntheticArgs) -> Result<Option<Vec<OverlaySpec>>> 
         serde_json::from_str(&raw_json).context("Parse variants JSON payload")?;
     let mut specs = Vec::new();
     for group in root.groups.values() {
+        if let Some(alt_frequency) = group.alt_frequency {
+            if !(0.0..=1.0).contains(&alt_frequency) {
+                bail!("group alt_frequency must be between 0 and 1");
+            }
+        }
+        let group_freqs = if let Some(raw) = group.genotype_frequencies {
+            Some(raw)
+        } else {
+            group
+                .alt_frequency
+                .map(|alt_frequency| GenotypeFrequenciesRaw {
+                    het: 0.0,
+                    hom_alt: alt_frequency,
+                })
+        };
         for variant in &group.variants {
-            specs.push(OverlaySpec::from_raw(variant)?);
+            let mut variant = variant.clone();
+            if variant.genotype_frequencies.is_none() {
+                variant.genotype_frequencies = group_freqs;
+            }
+            specs.push(OverlaySpec::from_raw(&variant)?);
         }
     }
     Ok(Some(specs))
@@ -481,10 +500,14 @@ struct OverlayRoot {
 
 #[derive(Debug, Deserialize)]
 struct OverlayGroup {
+    #[serde(default)]
+    alt_frequency: Option<f64>,
+    #[serde(default)]
+    genotype_frequencies: Option<GenotypeFrequenciesRaw>,
     variants: Vec<OverlayVariantRaw>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct OverlayVariantRaw {
     rsid: String,
     chromosome: String,
