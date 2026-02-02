@@ -238,7 +238,7 @@ jobs:
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build, publish-crate]
+    needs: [build, publish-crate, publish-docker-manifest]
     if: needs.build.result == 'success'
     steps:
       - uses: actions/checkout@v4
@@ -313,7 +313,7 @@ jobs:
       - name: Read version
         id: version
         run: |
-          version="$(grep '^version = ' cli/Cargo.toml | head -n1 | cut -d'\"' -f2 || true)"
+          version="$(grep '^version = ' cli/Cargo.toml | head -n1 | sed 's/.*\"\\(.*\\)\".*/\\1/' || true)"
           if [[ -z "${version}" ]]; then
             tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
             version="${tag#v}"
@@ -360,7 +360,7 @@ jobs:
       - name: Read version
         id: version
         run: |
-          version="$(grep '^version = ' cli/Cargo.toml | head -n1 | cut -d'\"' -f2 || true)"
+          version="$(grep '^version = ' cli/Cargo.toml | head -n1 | sed 's/.*\"\\(.*\\)\".*/\\1/' || true)"
           if [[ -z "${version}" ]]; then
             tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
             version="${tag#v}"
