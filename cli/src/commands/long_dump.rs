@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 
@@ -7,6 +8,7 @@ use crate::long_rows::LongRowReader;
 use crate::DumpLongArgs;
 
 pub fn run_long_dump(args: DumpLongArgs) -> Result<()> {
+    let start = Instant::now();
     let input = File::open(&args.input).with_context(|| format!("Open {:?}", args.input))?;
     let mut reader = LongRowReader::new(input);
     let mut writer = BufWriter::new(
@@ -28,5 +30,9 @@ pub fn run_long_dump(args: DumpLongArgs) -> Result<()> {
     }
     writer.flush().context("flush long dump")?;
     eprintln!("✅ dump-long: wrote {} rows", rows);
+    eprintln!(
+        "⏱️  dump-long: elapsed {:.2}s",
+        start.elapsed().as_secs_f64()
+    );
     Ok(())
 }

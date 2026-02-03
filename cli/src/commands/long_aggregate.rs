@@ -4,7 +4,9 @@ use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Mutex;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
@@ -14,6 +16,7 @@ use crate::long_rows::{LongRow, LongRowReader, LongRowWriter};
 use crate::AggregateLongArgs;
 
 pub fn run_long_aggregate(args: AggregateLongArgs) -> Result<()> {
+    let overall_start = Instant::now();
     let thread_count = resolve_thread_count(args.threads)?;
     let pool = ThreadPoolBuilder::new()
         .num_threads(thread_count)
@@ -28,13 +31,50 @@ pub fn run_long_aggregate(args: AggregateLongArgs) -> Result<()> {
     if input_files.is_empty() {
         bail!(format_input_error(&args));
     }
+    eprintln!(
+        "▶️  aggregate-long: {} input file(s), threads={}",
+        input_files.len(),
+        thread_count
+    );
 
-    let participants = collect_participants(&input_files)?;
-    if participants.is_empty() {
-        bail!("No participants found in long-row inputs");
+    let tmp_dir = args
+        .tmp_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("bvs-long"));
+    fs::create_dir_all(&tmp_dir).with_context(|| format!("Create temp dir {:?}", tmp_dir))?;
+
+    let chunk_records =
+        resolve_chunk_records(args.chunk_records, args.max_ram_percent, thread_count)?;
+    eprintln!(
+        "🧵 aggregate-long: building chunks + participants (single pass), chunk_records={}",
+        chunk_records
+    );
+    let chunk_build_start = Instant::now();
+    let chunk_result = pool.install(|| {
+        build_sharded_chunks(
+            &input_files,
+            &tmp_dir,
+            thread_count,
+            chunk_records,
+            thread_count,
+        )
+    })?;
+    if chunk_result.total_rows == 0 {
+        bail!("No records found in long-row inputs");
     }
+    eprintln!(
+        "📦 aggregate-long: scanned {} files, {} rows, {} shards",
+        input_files.len(),
+        chunk_result.total_rows,
+        chunk_result.chunk_files.len()
+    );
+    eprintln!(
+        "⏱️  aggregate-long: chunk build took {:.2}s",
+        chunk_build_start.elapsed().as_secs_f64()
+    );
+
     let participant_list = {
-        let mut list: Vec<String> = participants.into_iter().collect();
+        let mut list: Vec<String> = chunk_result.participants.into_iter().collect();
         list.sort();
         list
     };
@@ -44,64 +84,41 @@ pub fn run_long_aggregate(args: AggregateLongArgs) -> Result<()> {
         .map(|(idx, pid)| (pid.clone(), idx))
         .collect();
 
-    let tmp_dir = args
-        .tmp_dir
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("bvs-long"));
-    fs::create_dir_all(&tmp_dir).with_context(|| format!("Create temp dir {:?}", tmp_dir))?;
+    if participant_list.is_empty() {
+        bail!("No participants found in long-row inputs");
+    }
 
     if thread_count <= 1 {
-        let ctx = AggregateContext::new(
-            args.chunk_records,
-            thread_count,
-            &participant_list,
-            &participant_index,
-        );
-        aggregate_files(
+        eprintln!("🧵 aggregate-long: single-threaded merge path");
+        let ctx = AggregateContext::new(&participant_list, &participant_index);
+        aggregate_chunks(
             &ctx,
-            &input_files,
-            &tmp_dir,
+            &chunk_result.chunk_files[0],
             &args.matrix_tsv,
             &args.allele_freq_tsv,
         )?;
     } else {
-        let partition_dir = tmp_dir.join("partitions");
-        fs::create_dir_all(&partition_dir)
-            .with_context(|| format!("Create partition dir {:?}", partition_dir))?;
-        let partition_result = partition_by_locus(&input_files, &partition_dir, thread_count)?;
-        if partition_result.part_files.is_empty() {
-            bail!("No records found in long-row inputs");
-        }
-        eprintln!(
-            "🧩 aggregate-long: partitioned {} rows into {} shards",
-            partition_result.total_rows,
-            partition_result.part_files.len()
-        );
-
+        eprintln!("🧵 aggregate-long: parallel shard merge path");
+        let shard_start = Instant::now();
         let part_outputs = pool.install(|| {
-            partition_result
-                .part_files
+            chunk_result
+                .chunk_files
                 .par_iter()
                 .enumerate()
-                .map(|(idx, part_file)| {
+                .filter(|(_, chunks)| !chunks.is_empty())
+                .map(|(idx, shard_chunks)| {
+                    eprintln!(
+                        "🧩 aggregate-long: merging shard {} ({} chunks)",
+                        idx,
+                        shard_chunks.len()
+                    );
                     let part_dir = tmp_dir.join(format!("part-{}", idx));
                     fs::create_dir_all(&part_dir)
                         .with_context(|| format!("Create partition output dir {:?}", part_dir))?;
                     let matrix_path = part_dir.join("matrix.tsv");
                     let allele_path = part_dir.join("allele.tsv");
-                    let ctx = AggregateContext::new(
-                        args.chunk_records,
-                        1,
-                        &participant_list,
-                        &participant_index,
-                    );
-                    aggregate_files(
-                        &ctx,
-                        std::slice::from_ref(part_file),
-                        &part_dir,
-                        &matrix_path,
-                        &allele_path,
-                    )?;
+                    let ctx = AggregateContext::new(&participant_list, &participant_index);
+                    aggregate_chunks(&ctx, shard_chunks, &matrix_path, &allele_path)?;
                     Ok(PartitionOutput {
                         index: idx,
                         matrix: matrix_path,
@@ -110,15 +127,28 @@ pub fn run_long_aggregate(args: AggregateLongArgs) -> Result<()> {
                 })
                 .collect::<Result<Vec<PartitionOutput>>>()
         })?;
+        eprintln!(
+            "⏱️  aggregate-long: shard aggregation took {:.2}s",
+            shard_start.elapsed().as_secs_f64()
+        );
 
+        let concat_start = Instant::now();
         concat_partition_outputs(
             &part_outputs,
             &participant_list,
             &args.matrix_tsv,
             &args.allele_freq_tsv,
         )?;
+        eprintln!(
+            "⏱️  aggregate-long: concatenation took {:.2}s",
+            concat_start.elapsed().as_secs_f64()
+        );
     }
 
+    eprintln!(
+        "✅ aggregate-long: total elapsed {:.2}s",
+        overall_start.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -129,53 +159,26 @@ struct PartitionOutput {
     allele: PathBuf,
 }
 
-struct PartitionResult {
-    part_files: Vec<PathBuf>,
-    total_rows: u64,
-}
-
 struct AggregateContext<'a> {
-    chunk_records: usize,
-    thread_count: usize,
     participant_list: &'a [String],
     participant_index: &'a HashMap<String, usize>,
 }
 
 impl<'a> AggregateContext<'a> {
-    fn new(
-        chunk_records: usize,
-        thread_count: usize,
-        participant_list: &'a [String],
-        participant_index: &'a HashMap<String, usize>,
-    ) -> Self {
+    fn new(participant_list: &'a [String], participant_index: &'a HashMap<String, usize>) -> Self {
         Self {
-            chunk_records,
-            thread_count,
             participant_list,
             participant_index,
         }
     }
 }
 
-fn aggregate_files(
+fn aggregate_chunks(
     ctx: &AggregateContext<'_>,
-    input_files: &[PathBuf],
-    tmp_dir: &Path,
+    chunk_files: &[PathBuf],
     matrix_path: &Path,
     allele_path: &Path,
 ) -> Result<()> {
-    let chunk_result =
-        write_sorted_chunks(input_files, tmp_dir, ctx.chunk_records, ctx.thread_count)?;
-    if chunk_result.chunk_files.is_empty() {
-        bail!("No records found in long-row inputs");
-    }
-    eprintln!(
-        "📦 aggregate-long: scanned {} files, {} rows, {} chunks",
-        input_files.len(),
-        chunk_result.total_rows,
-        chunk_result.chunk_files.len()
-    );
-
     let mut matrix_writer = BufWriter::new(
         File::create(matrix_path).with_context(|| format!("Create {:?}", matrix_path))?,
     );
@@ -187,7 +190,7 @@ fn aggregate_files(
     write_allele_header(&mut allele_writer)?;
 
     merge_chunks(
-        &chunk_result.chunk_files,
+        chunk_files,
         ctx.participant_index,
         ctx.participant_list,
         &mut matrix_writer,
@@ -199,49 +202,115 @@ fn aggregate_files(
     Ok(())
 }
 
-fn partition_by_locus(
+struct ShardedChunks {
+    participants: HashSet<String>,
+    chunk_files: Vec<Vec<PathBuf>>,
+    total_rows: u64,
+}
+
+fn build_sharded_chunks(
     input_files: &[PathBuf],
-    partition_dir: &Path,
+    tmp_dir: &Path,
     shard_count: usize,
-) -> Result<PartitionResult> {
-    let mut writers = Vec::with_capacity(shard_count);
-    let mut counts = vec![0u64; shard_count];
+    chunk_records: usize,
+    thread_count: usize,
+) -> Result<ShardedChunks> {
+    let shard_count = shard_count.max(1);
+    let shard_chunks: Mutex<Vec<Vec<PathBuf>>> =
+        Mutex::new((0..shard_count).map(|_| Vec::new()).collect());
+    let participants: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+    let total_rows = AtomicU64::new(0);
+    let next_log_at = AtomicU64::new(1_000_000);
 
-    for idx in 0..shard_count {
-        let path = partition_dir.join(format!("part-{idx}.bvlr"));
-        let file = File::create(&path).with_context(|| format!("Create {:?}", path))?;
-        writers.push((path, LongRowWriter::new(BufWriter::new(file))));
-    }
+    input_files
+        .par_iter()
+        .enumerate()
+        .try_for_each(|(file_idx, path)| -> Result<()> {
+            let file = File::open(path).with_context(|| format!("Open {:?}", path))?;
+            let mut reader = LongRowReader::new(file);
+            let mut buffers: Vec<Vec<LongRow>> = (0..shard_count)
+                .map(|_| Vec::with_capacity(10_000))
+                .collect();
+            let mut local_participants: HashSet<String> = HashSet::new();
+            let mut chunk_indices: Vec<usize> = vec![0; shard_count];
+            let mut local_rows: u64 = 0;
 
-    let mut total_rows: u64 = 0;
-    let mut next_log_at: u64 = 5_000_000;
+            while let Some(row) = reader.read_row()? {
+                local_participants.insert(row.participant_id.clone());
+                let shard = shard_for(&row.locus_key, shard_count);
+                buffers[shard].push(row);
+                local_rows += 1;
 
-    for path in input_files {
-        let file = File::open(path).with_context(|| format!("Open {:?}", path))?;
-        let mut reader = LongRowReader::new(file);
-        while let Some(row) = reader.read_row()? {
-            let shard = shard_for(&row.locus_key, shard_count);
-            writers[shard].1.write_row(&row)?;
-            counts[shard] += 1;
-            total_rows += 1;
-            if total_rows >= next_log_at {
-                eprintln!("🧩 aggregate-long: partitioned {} rows", total_rows);
-                next_log_at += 5_000_000;
+                if buffers[shard].len() >= chunk_records {
+                    let chunk_path = write_shard_chunk(
+                        tmp_dir,
+                        shard,
+                        file_idx,
+                        chunk_indices[shard],
+                        &mut buffers[shard],
+                        thread_count,
+                    )?;
+                    {
+                        let mut guard = shard_chunks.lock().expect("shard chunk mutex poisoned");
+                        guard[shard].push(chunk_path);
+                    }
+                    chunk_indices[shard] += 1;
+                }
             }
-        }
-    }
 
-    let mut part_files = Vec::new();
-    for (idx, (path, mut writer)) in writers.into_iter().enumerate() {
-        writer.flush()?;
-        if counts[idx] > 0 {
-            part_files.push(path);
-        }
-    }
+            for shard in 0..shard_count {
+                if !buffers[shard].is_empty() {
+                    let chunk_path = write_shard_chunk(
+                        tmp_dir,
+                        shard,
+                        file_idx,
+                        chunk_indices[shard],
+                        &mut buffers[shard],
+                        thread_count,
+                    )?;
+                    let mut guard = shard_chunks.lock().expect("shard chunk mutex poisoned");
+                    guard[shard].push(chunk_path);
+                    chunk_indices[shard] += 1;
+                }
+            }
 
-    Ok(PartitionResult {
-        part_files,
-        total_rows,
+            {
+                let mut guard = participants.lock().expect("participants mutex poisoned");
+                guard.extend(local_participants);
+            }
+
+            let new_total = total_rows.fetch_add(local_rows, AtomicOrdering::Relaxed) + local_rows;
+            let mut next = next_log_at.load(AtomicOrdering::Relaxed);
+            while new_total >= next {
+                if next_log_at
+                    .compare_exchange(
+                        next,
+                        next + 1_000_000,
+                        AtomicOrdering::Relaxed,
+                        AtomicOrdering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    eprintln!("🧩 aggregate-long: partitioned {} rows", next);
+                    break;
+                }
+                next = next_log_at.load(AtomicOrdering::Relaxed);
+            }
+
+            Ok(())
+        })?;
+
+    let participants = participants
+        .into_inner()
+        .expect("participants mutex poisoned");
+    let chunk_files = shard_chunks
+        .into_inner()
+        .expect("shard chunk mutex poisoned");
+
+    Ok(ShardedChunks {
+        participants,
+        chunk_files,
+        total_rows: total_rows.load(AtomicOrdering::Relaxed),
     })
 }
 
@@ -415,59 +484,10 @@ fn format_input_error(args: &AggregateLongArgs) -> String {
     lines.join(" ")
 }
 
-fn collect_participants(files: &[PathBuf]) -> Result<HashSet<String>> {
-    let mut participants = HashSet::new();
-    for path in files {
-        let file = File::open(path).with_context(|| format!("Open {:?}", path))?;
-        let mut reader = LongRowReader::new(file);
-        while let Some(row) = reader.read_row()? {
-            participants.insert(row.participant_id);
-        }
-    }
-    Ok(participants)
-}
-
-struct ChunkResult {
-    chunk_files: Vec<PathBuf>,
-    total_rows: u64,
-}
-
-fn write_sorted_chunks(
-    files: &[PathBuf],
+fn write_shard_chunk(
     tmp_dir: &Path,
-    chunk_records: usize,
-    thread_count: usize,
-) -> Result<ChunkResult> {
-    let mut chunks = Vec::new();
-    let mut buffer: Vec<LongRow> = Vec::with_capacity(chunk_records);
-    let mut chunk_idx = 0;
-    let mut total_rows: u64 = 0;
-
-    for path in files {
-        let file = File::open(path).with_context(|| format!("Open {:?}", path))?;
-        let mut reader = LongRowReader::new(file);
-        while let Some(row) = reader.read_row()? {
-            total_rows += 1;
-            buffer.push(row);
-            if buffer.len() >= chunk_records {
-                let chunk_path = write_chunk(tmp_dir, chunk_idx, &mut buffer, thread_count)?;
-                chunks.push(chunk_path);
-                chunk_idx += 1;
-            }
-        }
-    }
-    if !buffer.is_empty() {
-        let chunk_path = write_chunk(tmp_dir, chunk_idx, &mut buffer, thread_count)?;
-        chunks.push(chunk_path);
-    }
-    Ok(ChunkResult {
-        chunk_files: chunks,
-        total_rows,
-    })
-}
-
-fn write_chunk(
-    tmp_dir: &Path,
+    shard: usize,
+    file_idx: usize,
     idx: usize,
     buffer: &mut Vec<LongRow>,
     thread_count: usize,
@@ -477,7 +497,10 @@ fn write_chunk(
     } else {
         buffer.sort_by(compare_row);
     }
-    let filename = format!("bvlr-chunk-{}-{}.bvlr", idx, unique_suffix());
+    let filename = format!(
+        "shard-{shard}-file-{file_idx}-chunk-{idx}-{}.bvlr",
+        unique_suffix()
+    );
     let path = tmp_dir.join(filename);
     let file = File::create(&path).with_context(|| format!("Create {:?}", path))?;
     let mut writer = LongRowWriter::new(BufWriter::new(file));
@@ -519,7 +542,7 @@ fn merge_chunks(
     let mut num_hetero: i64 = 0;
 
     let mut merged_rows: u64 = 0;
-    let mut next_log_at: u64 = 5_000_000;
+    let mut next_log_at: u64 = 1_000_000;
     while let Some(mut item) = heap.pop() {
         let row = &item.row;
         if current_locus.as_deref() != Some(&row.locus_key) {
@@ -569,7 +592,7 @@ fn merge_chunks(
         merged_rows += 1;
         if merged_rows >= next_log_at {
             eprintln!("🔀 aggregate-long: merged {} rows", merged_rows);
-            next_log_at += 5_000_000;
+            next_log_at += 1_000_000;
         }
     }
 
@@ -615,6 +638,56 @@ fn resolve_thread_count(requested: usize) -> Result<usize> {
         .map(|n| n.get())
         .unwrap_or(1);
     Ok(count.max(1))
+}
+
+fn resolve_chunk_records(requested: usize, max_ram_percent: u8, threads: usize) -> Result<usize> {
+    if requested > 0 {
+        return Ok(requested);
+    }
+    let available = detect_available_memory_bytes().unwrap_or(512 * 1024 * 1024);
+    let percent = max_ram_percent.clamp(10, 95) as u64;
+    let budget = available.saturating_mul(percent) / 100;
+    // Conservative row size estimate for BVLR rows (strings + overhead).
+    let bytes_per_row: u64 = 128;
+    let total_rows = budget / bytes_per_row;
+    let per_thread = (total_rows / threads.max(1) as u64).max(10_000);
+    Ok(per_thread as usize)
+}
+
+fn detect_available_memory_bytes() -> Option<u64> {
+    // cgroups v2
+    if let Ok(value) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        let trimmed = value.trim();
+        if trimmed != "max" {
+            if let Ok(bytes) = trimmed.parse::<u64>() {
+                if bytes > 0 {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+    // cgroups v1
+    if let Ok(value) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        if let Ok(bytes) = value.trim().parse::<u64>() {
+            if bytes > 0 {
+                return Some(bytes);
+            }
+        }
+    }
+    // /proc/meminfo fallback
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        for line in meminfo.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(kb) = parts[0].parse::<u64>() {
+                        return Some(kb * 1024);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn flush_matrix_row(
@@ -758,6 +831,7 @@ mod tests {
             tmp_dir: Some(tmp.join("tmp")),
             chunk_records: 2,
             threads: 0,
+            max_ram_percent: 80,
         };
         run_long_aggregate(args).unwrap();
 

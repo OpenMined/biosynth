@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
@@ -19,6 +20,7 @@ use rusqlite::OptionalExtension;
 const LOOKAHEAD_LINES: usize = 2048;
 
 pub fn run_long_emit(args: EmitLongArgs) -> Result<()> {
+    let overall_start = Instant::now();
     let has_vcf = args.vcf.is_some();
     let has_inputs = !args.inputs.is_empty();
     if has_vcf == has_inputs {
@@ -33,6 +35,10 @@ pub fn run_long_emit(args: EmitLongArgs) -> Result<()> {
             "✅ emit-long (vcf): {} variants, {} rows, {} missing-gt",
             stats.variants_seen, stats.rows_emitted, stats.missing_gt
         );
+        eprintln!(
+            "⏱️  emit-long: elapsed {:.2}s",
+            overall_start.elapsed().as_secs_f64()
+        );
         println!("✅ Emitted long rows to {}", output_path.display());
         return Ok(());
     }
@@ -43,21 +49,37 @@ pub fn run_long_emit(args: EmitLongArgs) -> Result<()> {
     if args.inputs.len() > 1 && args.participant.is_some() {
         bail!("--participant can only be used with a single --input file");
     }
+    if args.inputs.len() > 1 && args.missing_ref_log.is_some() {
+        bail!("--missing-ref-log can only be used with a single --input file");
+    }
 
     let sqlite_path = ensure_reference_db(Some(&args.sqlite), args.force_download)?;
     let store = StatsStore::connect_read_only(&sqlite_path)?;
     let mut resolver = ReferenceResolver::new(&store)?;
 
     for input in &args.inputs {
+        let start = Instant::now();
         let output_path = resolve_output_path(input, args.output.as_ref())?;
         let participant = args
             .participant
             .clone()
             .unwrap_or_else(|| default_participant(input));
-        let stats = emit_from_genotype(input, &output_path, &participant, &mut resolver)?;
+        let mut missing_logger = MissingRefLogger::new(args.missing_ref_log.as_deref())?;
+        let stats = emit_from_genotype(
+            input,
+            &output_path,
+            &participant,
+            &mut resolver,
+            &mut missing_logger,
+        )?;
         eprintln!(
             "✅ emit-long (genotype): {} parsed, {} rows, {} missing-ref, {} missing-gt",
             stats.rows_parsed, stats.rows_emitted, stats.missing_reference, stats.missing_gt
+        );
+        eprintln!(
+            "⏱️  emit-long: {} took {:.2}s",
+            input.display(),
+            start.elapsed().as_secs_f64()
         );
         println!(
             "✅ Emitted long rows to {} (participant {})",
@@ -65,6 +87,10 @@ pub fn run_long_emit(args: EmitLongArgs) -> Result<()> {
             participant
         );
     }
+    eprintln!(
+        "⏱️  emit-long: total elapsed {:.2}s",
+        overall_start.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -179,6 +205,7 @@ fn emit_from_genotype(
     output: &Path,
     participant: &str,
     resolver: &mut ReferenceResolver,
+    missing_logger: &mut MissingRefLogger,
 ) -> Result<EmitStats> {
     let input_file = File::open(input).with_context(|| format!("Open {:?}", input))?;
     let mut reader = BufReader::new(input_file);
@@ -211,15 +238,20 @@ fn emit_from_genotype(
         missing_reference: 0,
     };
 
+    let mut line_number: u64 = 0;
+    let mut ctx = GenotypeEmitContext {
+        parser: &mut parser,
+        writer: &mut writer,
+        participant,
+        resolver,
+        stats: &mut stats,
+        missing_logger,
+        input,
+    };
+
     for line in &buffered_lines {
-        consume_genotype_line(
-            line,
-            &mut parser,
-            &mut writer,
-            participant,
-            resolver,
-            &mut stats,
-        )?;
+        line_number += 1;
+        consume_genotype_line(&mut ctx, line, line_number)?;
     }
 
     buffer.clear();
@@ -229,39 +261,42 @@ fn emit_from_genotype(
         if bytes == 0 {
             break;
         }
-        consume_genotype_line(
-            &buffer,
-            &mut parser,
-            &mut writer,
-            participant,
-            resolver,
-            &mut stats,
-        )?;
+        line_number += 1;
+        consume_genotype_line(&mut ctx, &buffer, line_number)?;
     }
 
     writer.flush()?;
     Ok(stats)
 }
 
+struct GenotypeEmitContext<'a> {
+    parser: &'a mut RowParser,
+    writer: &'a mut LongRowWriter<BufWriter<File>>,
+    participant: &'a str,
+    resolver: &'a mut ReferenceResolver,
+    stats: &'a mut EmitStats,
+    missing_logger: &'a mut MissingRefLogger,
+    input: &'a Path,
+}
+
 fn consume_genotype_line(
+    ctx: &mut GenotypeEmitContext<'_>,
     line: &str,
-    parser: &mut RowParser,
-    writer: &mut LongRowWriter<BufWriter<File>>,
-    participant: &str,
-    resolver: &mut ReferenceResolver,
-    stats: &mut EmitStats,
+    line_number: u64,
 ) -> Result<()> {
-    match parser.consume_line(line)? {
+    match ctx.parser.consume_line(line)? {
         RowOutcome::Parsed(row) => {
-            stats.rows_parsed += 1;
+            ctx.stats.rows_parsed += 1;
             let rsid_label = row.rsid.trim();
             if rsid_label.is_empty() {
                 return Ok(());
             }
-            let reference = match resolver.resolve(rsid_label)? {
+            let reference = match ctx.resolver.resolve(rsid_label)? {
                 Some(reference) => reference,
                 None => {
-                    stats.missing_reference += 1;
+                    ctx.stats.missing_reference += 1;
+                    ctx.missing_logger
+                        .log(ctx.input, line_number, rsid_label, line)?;
                     return Ok(());
                 }
             };
@@ -274,7 +309,7 @@ fn consume_genotype_line(
                 parse_genotype_dosages(row.genotype.as_deref(), &reference_base, &alternates);
             if let Some(dosages) = dosages {
                 for (alt, dosage) in alternates.iter().zip(dosages.iter()) {
-                    writer.write_row(&LongRow {
+                    ctx.writer.write_row(&LongRow {
                         locus_key: locus_key(
                             &reference.chromosome,
                             reference.position,
@@ -282,15 +317,15 @@ fn consume_genotype_line(
                             alt,
                         ),
                         rsid: rsid_label.to_string(),
-                        participant_id: participant.to_string(),
+                        participant_id: ctx.participant.to_string(),
                         dosage: *dosage,
                     })?;
-                    stats.rows_emitted += 1;
+                    ctx.stats.rows_emitted += 1;
                 }
             } else {
-                stats.missing_gt += 1;
+                ctx.stats.missing_gt += 1;
                 for alt in &alternates {
-                    writer.write_row(&LongRow {
+                    ctx.writer.write_row(&LongRow {
                         locus_key: locus_key(
                             &reference.chromosome,
                             reference.position,
@@ -298,16 +333,57 @@ fn consume_genotype_line(
                             alt,
                         ),
                         rsid: rsid_label.to_string(),
-                        participant_id: participant.to_string(),
+                        participant_id: ctx.participant.to_string(),
                         dosage: -1,
                     })?;
-                    stats.rows_emitted += 1;
+                    ctx.stats.rows_emitted += 1;
                 }
             }
         }
         RowOutcome::Skipped | RowOutcome::Ignored => {}
     }
     Ok(())
+}
+
+struct MissingRefLogger {
+    writer: Option<BufWriter<File>>,
+}
+
+impl MissingRefLogger {
+    fn new(path: Option<&Path>) -> Result<Self> {
+        let writer = if let Some(path) = path {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("Create {:?}", parent))?;
+                }
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("Open {:?}", path))?;
+            Some(BufWriter::new(file))
+        } else {
+            None
+        };
+        Ok(Self { writer })
+    }
+
+    fn log(&mut self, input: &Path, line_number: u64, rsid: &str, raw_line: &str) -> Result<()> {
+        if let Some(writer) = self.writer.as_mut() {
+            let trimmed = raw_line.trim_end();
+            writeln!(
+                writer,
+                "{}\t{}\t{}\tmissing_ref\t{}",
+                input.display(),
+                line_number,
+                rsid,
+                trimmed
+            )?;
+        }
+        Ok(())
+    }
 }
 
 fn resolve_output_path(input: &Path, output: Option<&PathBuf>) -> Result<PathBuf> {

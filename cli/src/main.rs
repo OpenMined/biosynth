@@ -177,6 +177,9 @@ pub struct EmitLongArgs {
     /// Participant id (defaults to filename stem or VCF sample name if present).
     #[arg(long)]
     pub participant: Option<String>,
+    /// Optional log file for missing reference rows (appends).
+    #[arg(long)]
+    pub missing_ref_log: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -199,9 +202,12 @@ pub struct AggregateLongArgs {
     /// Optional temp directory (defaults to system temp).
     #[arg(long)]
     pub tmp_dir: Option<PathBuf>,
-    /// Number of records per chunk during external sort.
-    #[arg(long, default_value = "500000")]
+    /// Number of records per chunk during external sort (0 = auto).
+    #[arg(long, default_value = "0")]
     pub chunk_records: usize,
+    /// Max RAM percent to use when auto-sizing chunk records.
+    #[arg(long, default_value = "80")]
+    pub max_ram_percent: u8,
     /// Number of worker threads to use (0 = auto/all cores).
     #[arg(long, default_value = "0")]
     pub threads: usize,
