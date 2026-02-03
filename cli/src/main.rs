@@ -6,6 +6,7 @@ use clap::{ArgAction, Args, Parser, Subcommand};
 mod download;
 mod genotype;
 mod genotype_reader;
+mod long_rows;
 mod rsid_cache;
 mod stats;
 mod util;
@@ -15,6 +16,9 @@ use crate::commands::genostats::run_genostats;
 use crate::commands::genotype_to_vcf::run_genotype_to_vcf;
 use crate::commands::list_missing_cache::run_list_missing_cache;
 use crate::commands::list_missing_rsids::run_list_missing_rsids;
+use crate::commands::long_aggregate::run_long_aggregate;
+use crate::commands::long_dump::run_long_dump;
+use crate::commands::long_emit::run_long_emit;
 use crate::commands::reference_load::run_reference_load;
 use crate::commands::resolve_rsids::run_resolve_rsids;
 use crate::commands::sync_rsid_cache::run_sync_rsid_cache;
@@ -27,6 +31,9 @@ mod commands {
     pub mod genotype_to_vcf;
     pub mod list_missing_cache;
     pub mod list_missing_rsids;
+    pub mod long_aggregate;
+    pub mod long_dump;
+    pub mod long_emit;
     pub mod reference_load;
     pub mod resolve_rsids;
     pub mod sync_rsid_cache;
@@ -49,6 +56,12 @@ enum Commands {
     AlleleReport(AlleleReportArgs),
     /// Convert a genotype file into a single-sample VCF.
     GenotypeToVcf(GenotypeToVcfArgs),
+    /// Emit compact long-row records from a VCF or genotype file.
+    EmitLong(EmitLongArgs),
+    /// Aggregate long-row records into matrix and allele frequency TSVs.
+    AggregateLong(AggregateLongArgs),
+    /// Convert a .bvlr file into TSV for debugging.
+    DumpLong(DumpLongArgs),
     /// List rsids missing from the database based on a cache file.
     ListMissingCache(ListMissingCacheArgs),
     /// List rsids missing from the reference database.
@@ -142,6 +155,66 @@ pub struct GenotypeToVcfArgs {
     /// Optional rsid cache file for fallback lookups.
     #[arg(long)]
     pub cache: Option<PathBuf>,
+}
+
+#[derive(Args, Clone)]
+pub struct EmitLongArgs {
+    /// Input genotype file(s) (tab/space/comma-delimited).
+    #[arg(short = 'i', long = "input")]
+    pub inputs: Vec<PathBuf>,
+    /// Input VCF file (plain or gz). Mutually exclusive with --input.
+    #[arg(long)]
+    pub vcf: Option<PathBuf>,
+    /// Path to the SQLite database containing rsid_reference data.
+    #[arg(long, default_value = "data/genostats.sqlite")]
+    pub sqlite: PathBuf,
+    /// Force re-download of the reference database.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub force_download: bool,
+    /// Output file (defaults to <input>.bvlr or <vcf>.bvlr).
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    /// Participant id (defaults to filename stem or VCF sample name if present).
+    #[arg(long)]
+    pub participant: Option<String>,
+}
+
+#[derive(Args, Clone)]
+pub struct AggregateLongArgs {
+    /// Input files or directories containing .bvlr files.
+    #[arg(short = 'i', long = "input")]
+    pub inputs: Vec<PathBuf>,
+    /// File containing input paths (one per line, # comments allowed).
+    #[arg(long)]
+    pub input_list: Option<PathBuf>,
+    /// Glob pattern for input files (e.g. "*.bvlr").
+    #[arg(long)]
+    pub input_glob: Option<String>,
+    /// Output matrix TSV path.
+    #[arg(long)]
+    pub matrix_tsv: PathBuf,
+    /// Output allele frequency TSV path.
+    #[arg(long)]
+    pub allele_freq_tsv: PathBuf,
+    /// Optional temp directory (defaults to system temp).
+    #[arg(long)]
+    pub tmp_dir: Option<PathBuf>,
+    /// Number of records per chunk during external sort.
+    #[arg(long, default_value = "500000")]
+    pub chunk_records: usize,
+    /// Number of worker threads to use (0 = auto/all cores).
+    #[arg(long, default_value = "0")]
+    pub threads: usize,
+}
+
+#[derive(Args, Clone)]
+pub struct DumpLongArgs {
+    /// Input .bvlr file to dump.
+    #[arg(long)]
+    pub input: PathBuf,
+    /// Output TSV path.
+    #[arg(long)]
+    pub output: PathBuf,
 }
 
 #[derive(Args, Clone)]
@@ -298,6 +371,9 @@ fn main() -> Result<()> {
         Commands::Genostats(args) => run_genostats(args),
         Commands::AlleleReport(args) => run_allele_report(args),
         Commands::GenotypeToVcf(args) => run_genotype_to_vcf(args),
+        Commands::EmitLong(args) => run_long_emit(args),
+        Commands::AggregateLong(args) => run_long_aggregate(args),
+        Commands::DumpLong(args) => run_long_dump(args),
         Commands::ListMissingCache(args) => run_list_missing_cache(args),
         Commands::ListMissingRsids(args) => run_list_missing_rsids(args),
         Commands::ResolveRsids(args) => run_resolve_rsids(args),
