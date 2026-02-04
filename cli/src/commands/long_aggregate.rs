@@ -15,6 +15,10 @@ use rayon::ThreadPoolBuilder;
 use crate::long_rows::{LongRow, LongRowReader, LongRowWriter};
 use crate::AggregateLongArgs;
 
+fn env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok())
+}
+
 pub fn run_long_aggregate(args: AggregateLongArgs) -> Result<()> {
     let overall_start = Instant::now();
     let thread_count = resolve_thread_count(args.threads)?;
@@ -50,6 +54,7 @@ pub fn run_long_aggregate(args: AggregateLongArgs) -> Result<()> {
         chunk_records
     );
     let chunk_build_start = Instant::now();
+    let progress_every = env_u64("BVS_AGG_PROGRESS_EVERY").unwrap_or(1_000_000);
     let chunk_result = pool.install(|| {
         build_sharded_chunks(
             &input_files,
@@ -57,6 +62,7 @@ pub fn run_long_aggregate(args: AggregateLongArgs) -> Result<()> {
             thread_count,
             chunk_records,
             thread_count,
+            progress_every,
         )
     })?;
     if chunk_result.total_rows == 0 {
@@ -214,18 +220,26 @@ fn build_sharded_chunks(
     shard_count: usize,
     chunk_records: usize,
     thread_count: usize,
+    progress_every: u64,
 ) -> Result<ShardedChunks> {
     let shard_count = shard_count.max(1);
     let shard_chunks: Mutex<Vec<Vec<PathBuf>>> =
         Mutex::new((0..shard_count).map(|_| Vec::new()).collect());
     let participants: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
     let total_rows = AtomicU64::new(0);
-    let next_log_at = AtomicU64::new(1_000_000);
+    let next_log_at = AtomicU64::new(progress_every.max(1));
+    let start = Instant::now();
 
     input_files
         .par_iter()
         .enumerate()
         .try_for_each(|(file_idx, path)| -> Result<()> {
+            let file_start = Instant::now();
+            eprintln!(
+                "📥 aggregate-long: reading {} ({})",
+                file_idx + 1,
+                path.display()
+            );
             let file = File::open(path).with_context(|| format!("Open {:?}", path))?;
             let mut reader = LongRowReader::new(file);
             let mut buffers: Vec<Vec<LongRow>> = (0..shard_count)
@@ -280,22 +294,35 @@ fn build_sharded_chunks(
             }
 
             let new_total = total_rows.fetch_add(local_rows, AtomicOrdering::Relaxed) + local_rows;
-            let mut next = next_log_at.load(AtomicOrdering::Relaxed);
-            while new_total >= next {
-                if next_log_at
-                    .compare_exchange(
-                        next,
-                        next + 1_000_000,
-                        AtomicOrdering::Relaxed,
-                        AtomicOrdering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    eprintln!("🧩 aggregate-long: partitioned {} rows", next);
-                    break;
+            if progress_every > 0 {
+                let mut next = next_log_at.load(AtomicOrdering::Relaxed);
+                while new_total >= next {
+                    if next_log_at
+                        .compare_exchange(
+                            next,
+                            next + progress_every,
+                            AtomicOrdering::Relaxed,
+                            AtomicOrdering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        eprintln!(
+                            "?? aggregate-long: partitioned {} rows ({:.1}s elapsed)",
+                            next,
+                            start.elapsed().as_secs_f64()
+                        );
+                        break;
+                    }
+                    next = next_log_at.load(AtomicOrdering::Relaxed);
                 }
-                next = next_log_at.load(AtomicOrdering::Relaxed);
             }
+
+            eprintln!(
+                "?? aggregate-long: finished {} rows from {} ({:.2}s)",
+                local_rows,
+                path.display(),
+                file_start.elapsed().as_secs_f64()
+            );
 
             Ok(())
         })?;
