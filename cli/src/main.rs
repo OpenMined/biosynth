@@ -193,9 +193,9 @@ pub struct AggregateLongArgs {
     /// Glob pattern for input files (e.g. "*.bvlr").
     #[arg(long)]
     pub input_glob: Option<String>,
-    /// Output matrix TSV path.
+    /// Output matrix TSV path (omit to skip matrix generation).
     #[arg(long)]
-    pub matrix_tsv: PathBuf,
+    pub matrix_tsv: Option<PathBuf>,
     /// Output allele frequency TSV path.
     #[arg(long)]
     pub allele_freq_tsv: PathBuf,
