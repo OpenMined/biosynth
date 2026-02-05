@@ -5,6 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,6 +23,7 @@ fn env_u64(name: &str) -> Option<u64> {
 pub fn run_long_aggregate(args: AggregateLongArgs) -> Result<()> {
     let overall_start = Instant::now();
     let thread_count = resolve_thread_count(args.threads)?;
+    let write_matrix = args.matrix_tsv.is_some();
     let pool = ThreadPoolBuilder::new()
         .num_threads(thread_count)
         .build()
@@ -63,6 +65,7 @@ pub fn run_long_aggregate(args: AggregateLongArgs) -> Result<()> {
             chunk_records,
             thread_count,
             progress_every,
+            write_matrix,
         )
     })?;
     if chunk_result.total_rows == 0 {
@@ -79,18 +82,24 @@ pub fn run_long_aggregate(args: AggregateLongArgs) -> Result<()> {
         chunk_build_start.elapsed().as_secs_f64()
     );
 
-    let participant_list = {
+    let participant_list = if write_matrix {
         let mut list: Vec<String> = chunk_result.participants.into_iter().collect();
         list.sort();
         list
+    } else {
+        Vec::new()
     };
-    let participant_index: HashMap<String, usize> = participant_list
-        .iter()
-        .enumerate()
-        .map(|(idx, pid)| (pid.clone(), idx))
-        .collect();
+    let participant_index: HashMap<String, usize> = if write_matrix {
+        participant_list
+            .iter()
+            .enumerate()
+            .map(|(idx, pid)| (pid.clone(), idx))
+            .collect()
+    } else {
+        HashMap::new()
+    };
 
-    if participant_list.is_empty() {
+    if write_matrix && participant_list.is_empty() {
         bail!("No participants found in long-row inputs");
     }
 
@@ -100,12 +109,22 @@ pub fn run_long_aggregate(args: AggregateLongArgs) -> Result<()> {
         aggregate_chunks(
             &ctx,
             &chunk_result.chunk_files[0],
-            &args.matrix_tsv,
+            args.matrix_tsv.as_deref(),
             &args.allele_freq_tsv,
+            MergeProgress {
+                total_rows: chunk_result.total_rows,
+                global_merged: None,
+                global_next_log_at: None,
+            },
         )?;
     } else {
         eprintln!("🧵 aggregate-long: parallel shard merge path");
         let shard_start = Instant::now();
+        let progress = MergeProgress {
+            total_rows: chunk_result.total_rows,
+            global_merged: Some(Arc::new(AtomicU64::new(0))),
+            global_next_log_at: Some(Arc::new(AtomicU64::new(1_000_000))),
+        };
         let part_outputs = pool.install(|| {
             chunk_result
                 .chunk_files
@@ -121,10 +140,19 @@ pub fn run_long_aggregate(args: AggregateLongArgs) -> Result<()> {
                     let part_dir = tmp_dir.join(format!("part-{}", idx));
                     fs::create_dir_all(&part_dir)
                         .with_context(|| format!("Create partition output dir {:?}", part_dir))?;
-                    let matrix_path = part_dir.join("matrix.tsv");
                     let allele_path = part_dir.join("allele.tsv");
+                    let matrix_path = args
+                        .matrix_tsv
+                        .as_ref()
+                        .map(|_| part_dir.join("matrix.tsv"));
                     let ctx = AggregateContext::new(&participant_list, &participant_index);
-                    aggregate_chunks(&ctx, shard_chunks, &matrix_path, &allele_path)?;
+                    aggregate_chunks(
+                        &ctx,
+                        shard_chunks,
+                        matrix_path.as_deref(),
+                        &allele_path,
+                        progress.clone(),
+                    )?;
                     Ok(PartitionOutput {
                         index: idx,
                         matrix: matrix_path,
@@ -142,7 +170,7 @@ pub fn run_long_aggregate(args: AggregateLongArgs) -> Result<()> {
         concat_partition_outputs(
             &part_outputs,
             &participant_list,
-            &args.matrix_tsv,
+            args.matrix_tsv.as_deref(),
             &args.allele_freq_tsv,
         )?;
         eprintln!(
@@ -161,7 +189,7 @@ pub fn run_long_aggregate(args: AggregateLongArgs) -> Result<()> {
 #[derive(Clone)]
 struct PartitionOutput {
     index: usize,
-    matrix: PathBuf,
+    matrix: Option<PathBuf>,
     allele: PathBuf,
 }
 
@@ -179,16 +207,28 @@ impl<'a> AggregateContext<'a> {
     }
 }
 
+#[derive(Clone)]
+struct MergeProgress {
+    total_rows: u64,
+    global_merged: Option<Arc<AtomicU64>>,
+    global_next_log_at: Option<Arc<AtomicU64>>,
+}
+
 fn aggregate_chunks(
     ctx: &AggregateContext<'_>,
     chunk_files: &[PathBuf],
-    matrix_path: &Path,
+    matrix_path: Option<&Path>,
     allele_path: &Path,
+    progress: MergeProgress,
 ) -> Result<()> {
-    let mut matrix_writer = BufWriter::new(
-        File::create(matrix_path).with_context(|| format!("Create {:?}", matrix_path))?,
-    );
-    write_matrix_header(&mut matrix_writer, ctx.participant_list)?;
+    let mut matrix_writer = if let Some(path) = matrix_path {
+        let mut writer =
+            BufWriter::new(File::create(path).with_context(|| format!("Create {:?}", path))?);
+        write_matrix_header(&mut writer, ctx.participant_list)?;
+        Some(writer)
+    } else {
+        None
+    };
 
     let mut allele_writer = BufWriter::new(
         File::create(allele_path).with_context(|| format!("Create {:?}", allele_path))?,
@@ -199,11 +239,14 @@ fn aggregate_chunks(
         chunk_files,
         ctx.participant_index,
         ctx.participant_list,
-        &mut matrix_writer,
+        matrix_writer.as_mut(),
         &mut allele_writer,
+        &progress,
     )?;
 
-    matrix_writer.flush()?;
+    if let Some(writer) = matrix_writer.as_mut() {
+        writer.flush()?;
+    }
     allele_writer.flush()?;
     Ok(())
 }
@@ -221,11 +264,13 @@ fn build_sharded_chunks(
     chunk_records: usize,
     thread_count: usize,
     progress_every: u64,
+    collect_participants: bool,
 ) -> Result<ShardedChunks> {
     let shard_count = shard_count.max(1);
     let shard_chunks: Mutex<Vec<Vec<PathBuf>>> =
         Mutex::new((0..shard_count).map(|_| Vec::new()).collect());
-    let participants: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+    let participants: Option<Mutex<HashSet<String>>> =
+        collect_participants.then(|| Mutex::new(HashSet::new()));
     let total_rows = AtomicU64::new(0);
     let next_log_at = AtomicU64::new(progress_every.max(1));
     let start = Instant::now();
@@ -245,12 +290,14 @@ fn build_sharded_chunks(
             let mut buffers: Vec<Vec<LongRow>> = (0..shard_count)
                 .map(|_| Vec::with_capacity(10_000))
                 .collect();
-            let mut local_participants: HashSet<String> = HashSet::new();
+            let mut local_participants: Option<HashSet<String>> =
+                collect_participants.then(HashSet::new);
             let mut chunk_indices: Vec<usize> = vec![0; shard_count];
             let mut local_rows: u64 = 0;
-
             while let Some(row) = reader.read_row()? {
-                local_participants.insert(row.participant_id.clone());
+                if let Some(local) = local_participants.as_mut() {
+                    local.insert(row.participant_id.clone());
+                }
                 let shard = shard_for(&row.locus_key, shard_count);
                 buffers[shard].push(row);
                 local_rows += 1;
@@ -288,6 +335,8 @@ fn build_sharded_chunks(
                 }
             }
 
+            if let (Some(participants), Some(local_participants)) =
+                (participants.as_ref(), local_participants)
             {
                 let mut guard = participants.lock().expect("participants mutex poisoned");
                 guard.extend(local_participants);
@@ -327,9 +376,13 @@ fn build_sharded_chunks(
             Ok(())
         })?;
 
-    let participants = participants
-        .into_inner()
-        .expect("participants mutex poisoned");
+    let participants = if let Some(participants) = participants {
+        participants
+            .into_inner()
+            .expect("participants mutex poisoned")
+    } else {
+        HashSet::new()
+    };
     let chunk_files = shard_chunks
         .into_inner()
         .expect("shard chunk mutex poisoned");
@@ -350,20 +403,23 @@ fn shard_for(value: &str, shard_count: usize) -> usize {
 fn concat_partition_outputs(
     outputs: &[PartitionOutput],
     participants: &[String],
-    matrix_path: &Path,
+    matrix_path: Option<&Path>,
     allele_path: &Path,
 ) -> Result<()> {
     let mut ordered = outputs.to_vec();
     ordered.sort_by_key(|out| out.index);
 
-    let mut matrix_writer = BufWriter::new(
-        File::create(matrix_path).with_context(|| format!("Create {:?}", matrix_path))?,
-    );
-    write_matrix_header(&mut matrix_writer, participants)?;
-    for part in &ordered {
-        append_without_header(&part.matrix, &mut matrix_writer)?;
+    if let Some(path) = matrix_path {
+        let mut matrix_writer =
+            BufWriter::new(File::create(path).with_context(|| format!("Create {:?}", path))?);
+        write_matrix_header(&mut matrix_writer, participants)?;
+        for part in &ordered {
+            if let Some(part_matrix) = &part.matrix {
+                append_without_header(part_matrix, &mut matrix_writer)?;
+            }
+        }
+        matrix_writer.flush()?;
     }
-    matrix_writer.flush()?;
 
     let mut allele_writer = BufWriter::new(
         File::create(allele_path).with_context(|| format!("Create {:?}", allele_path))?,
@@ -543,8 +599,9 @@ fn merge_chunks(
     chunks: &[PathBuf],
     participant_index: &HashMap<String, usize>,
     participants: &[String],
-    matrix_writer: &mut BufWriter<File>,
+    mut matrix_writer: Option<&mut BufWriter<File>>,
     allele_writer: &mut BufWriter<File>,
+    progress: &MergeProgress,
 ) -> Result<()> {
     let mut readers: Vec<LongRowReader<File>> = Vec::new();
     for path in chunks {
@@ -561,6 +618,7 @@ fn merge_chunks(
 
     let mut current_locus: Option<String> = None;
     let mut current_rsid = String::new();
+    let write_matrix = matrix_writer.is_some();
     let mut current_row: Vec<i8> = Vec::new();
 
     let mut allele_count: i64 = 0;
@@ -574,7 +632,9 @@ fn merge_chunks(
         let row = &item.row;
         if current_locus.as_deref() != Some(&row.locus_key) {
             if let Some(locus) = current_locus.take() {
-                flush_matrix_row(matrix_writer, &locus, &current_rsid, &current_row)?;
+                if let Some(writer) = matrix_writer.as_mut() {
+                    flush_matrix_row(writer, &locus, &current_rsid, &current_row)?;
+                }
                 flush_allele_row(
                     allele_writer,
                     &locus,
@@ -587,7 +647,9 @@ fn merge_chunks(
             }
             current_locus = Some(row.locus_key.clone());
             current_rsid = row.rsid.clone();
-            current_row = vec![-1; participants.len()];
+            if write_matrix {
+                current_row = vec![-1; participants.len()];
+            }
             allele_count = 0;
             n_obs = 0;
             num_homo = 0;
@@ -596,9 +658,11 @@ fn merge_chunks(
             current_rsid = row.rsid.clone();
         }
 
-        if let Some(idx) = participant_index.get(&row.participant_id) {
-            if current_row[*idx] == -1 && row.dosage != -1 {
-                current_row[*idx] = row.dosage;
+        if write_matrix {
+            if let Some(idx) = participant_index.get(&row.participant_id) {
+                if current_row[*idx] == -1 && row.dosage != -1 {
+                    current_row[*idx] = row.dosage;
+                }
             }
         }
 
@@ -617,14 +681,49 @@ fn merge_chunks(
             heap.push(item);
         }
         merged_rows += 1;
-        if merged_rows >= next_log_at {
-            eprintln!("🔀 aggregate-long: merged {} rows", merged_rows);
+        if let (Some(global), Some(next_at)) =
+            (&progress.global_merged, &progress.global_next_log_at)
+        {
+            let new_total = global.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            let mut next = next_at.load(AtomicOrdering::Relaxed);
+            while new_total >= next {
+                if next_at
+                    .compare_exchange(
+                        next,
+                        next + 1_000_000,
+                        AtomicOrdering::Relaxed,
+                        AtomicOrdering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    if progress.total_rows > 0 {
+                        let pct = (new_total as f64 / progress.total_rows as f64) * 100.0;
+                        eprintln!("🔀 aggregate-long: merged {} rows ({:.1}%)", new_total, pct);
+                    } else {
+                        eprintln!("🔀 aggregate-long: merged {} rows", new_total);
+                    }
+                    break;
+                }
+                next = next_at.load(AtomicOrdering::Relaxed);
+            }
+        } else if merged_rows >= next_log_at {
+            if progress.total_rows > 0 {
+                let pct = (merged_rows as f64 / progress.total_rows as f64) * 100.0;
+                eprintln!(
+                    "🔀 aggregate-long: merged {} rows ({:.1}%)",
+                    merged_rows, pct
+                );
+            } else {
+                eprintln!("🔀 aggregate-long: merged {} rows", merged_rows);
+            }
             next_log_at += 1_000_000;
         }
     }
 
     if let Some(locus) = current_locus.take() {
-        flush_matrix_row(matrix_writer, &locus, &current_rsid, &current_row)?;
+        if let Some(writer) = matrix_writer.as_mut() {
+            flush_matrix_row(writer, &locus, &current_rsid, &current_row)?;
+        }
         flush_allele_row(
             allele_writer,
             &locus,
@@ -636,7 +735,29 @@ fn merge_chunks(
         )?;
     }
 
-    eprintln!("✅ aggregate-long: merge complete ({} rows)", merged_rows);
+    if let Some(global) = progress.global_merged.as_ref() {
+        let global_rows = global.load(AtomicOrdering::Relaxed);
+        if progress.total_rows > 0 {
+            let pct = (global_rows as f64 / progress.total_rows as f64) * 100.0;
+            eprintln!(
+                "✅ aggregate-long: merge complete (shard {} rows, overall {:.1}%)",
+                merged_rows, pct
+            );
+        } else {
+            eprintln!(
+                "✅ aggregate-long: merge complete (shard {} rows)",
+                merged_rows
+            );
+        }
+    } else if progress.total_rows > 0 {
+        let pct = (merged_rows as f64 / progress.total_rows as f64) * 100.0;
+        eprintln!(
+            "✅ aggregate-long: merge complete ({} rows, {:.1}%)",
+            merged_rows, pct
+        );
+    } else {
+        eprintln!("✅ aggregate-long: merge complete ({} rows)", merged_rows);
+    }
     Ok(())
 }
 
@@ -853,7 +974,7 @@ mod tests {
             inputs: vec![file1.clone(), file2.clone()],
             input_list: None,
             input_glob: None,
-            matrix_tsv: tmp.join("matrix.tsv"),
+            matrix_tsv: Some(tmp.join("matrix.tsv")),
             allele_freq_tsv: tmp.join("allele.tsv"),
             tmp_dir: Some(tmp.join("tmp")),
             chunk_records: 2,
