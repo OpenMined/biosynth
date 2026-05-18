@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 mod download;
 mod genotype;
@@ -16,6 +16,7 @@ use crate::commands::genostats::run_genostats;
 use crate::commands::genotype_to_vcf::run_genotype_to_vcf;
 use crate::commands::list_missing_cache::run_list_missing_cache;
 use crate::commands::list_missing_rsids::run_list_missing_rsids;
+use crate::commands::load_non_rsids::run_load_non_rsids;
 use crate::commands::long_aggregate::run_long_aggregate;
 use crate::commands::long_dump::run_long_dump;
 use crate::commands::long_emit::run_long_emit;
@@ -31,6 +32,7 @@ mod commands {
     pub mod genotype_to_vcf;
     pub mod list_missing_cache;
     pub mod list_missing_rsids;
+    pub mod load_non_rsids;
     pub mod long_aggregate;
     pub mod long_dump;
     pub mod long_emit;
@@ -70,6 +72,8 @@ enum Commands {
     ResolveRsids(ResolveRsidsArgs),
     /// Load reference allele lookup data into SQLite.
     ReferenceLoad(ReferenceLoadArgs),
+    /// Load resolved non-rsid markers into the grch38_non_rsids table.
+    LoadNonRsids(LoadNonRsidsArgs),
     /// Sync rsid cache entries into the SQLite user override table.
     SyncRsidCache(SyncRsidCacheArgs),
     /// Generate a reference genotype file from stored data.
@@ -121,6 +125,19 @@ pub struct ReferenceLoadArgs {
     /// CSV produced by `scripts/extract_reference_variants.py`.
     #[arg(long)]
     pub lookup: PathBuf,
+}
+
+#[derive(Args, Clone)]
+pub struct LoadNonRsidsArgs {
+    /// Path to the SQLite database.
+    #[arg(long, default_value = "data/genostats.sqlite")]
+    pub sqlite: PathBuf,
+    /// Resolved CSV (…nonrsids.resolved.dedup.csv) to load.
+    #[arg(long)]
+    pub lookup: PathBuf,
+    /// Source tag stored with each row.
+    #[arg(long, default_value = "ensembl_grch38")]
+    pub source: String,
 }
 
 #[derive(Args, Clone)]
@@ -296,8 +313,19 @@ pub struct SyncRsidCacheArgs {
     pub apply: bool,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyntheticFormat {
+    /// Dynamic DNA (DDNA) plus-strand genotype text (default).
+    Ddna,
+    /// Illumina GenomeStudio GSGT Final Report.
+    Illumina,
+}
+
 #[derive(Args, Clone)]
 pub struct SyntheticArgs {
+    /// Output file format.
+    #[arg(long = "format", value_enum, default_value_t = SyntheticFormat::Ddna)]
+    pub format: SyntheticFormat,
     /// Path to the SQLite database containing rsid_reference data (uses data/genostats.sqlite in production).
     #[arg(long, default_value = "data/genostats.sqlite")]
     pub sqlite: PathBuf,
@@ -384,6 +412,7 @@ fn main() -> Result<()> {
         Commands::ListMissingRsids(args) => run_list_missing_rsids(args),
         Commands::ResolveRsids(args) => run_resolve_rsids(args),
         Commands::ReferenceLoad(args) => run_reference_load(args),
+        Commands::LoadNonRsids(args) => run_load_non_rsids(args),
         Commands::SyncRsidCache(args) => run_sync_rsid_cache(args),
         Commands::Synthetic(args) => run_synthetic(args),
         Commands::Update(args) => run_update(args),

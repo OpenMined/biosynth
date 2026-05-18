@@ -134,19 +134,26 @@ impl StatsStore {
             .query_row("SELECT COUNT(*) FROM rsid_reference", [], |row| row.get(0))
             .unwrap_or(0);
 
-        let formats_seen = self.collect_category_counts(
-            &conn,
-            "SELECT f.name, COUNT(rr.rsid)
-             FROM formats f
-             LEFT JOIN rsid_reference rr ON rr.format_id = f.id
-             GROUP BY f.id
-             ORDER BY COUNT(rr.rsid) DESC",
-        )?;
-        let builds_seen = self.collect_category_counts(
-            &conn,
-            "SELECT genome_build, COUNT(*) FROM formats GROUP BY genome_build ORDER BY COUNT(*) DESC",
-        )?;
-        let total_variants = formats_seen.iter().map(|entry| entry.count).sum();
+        let non_rsids: i64 = conn
+            .query_row("SELECT COUNT(*) FROM grch38_non_rsids", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        let formats_seen = vec![
+            CategoryCount {
+                value: Some("rsid_reference".to_string()),
+                count: unique_rsids as u64,
+            },
+            CategoryCount {
+                value: Some("grch38_non_rsids".to_string()),
+                count: non_rsids as u64,
+            },
+        ];
+        let total_variants = (unique_rsids + non_rsids) as u64;
+        let builds_seen = vec![CategoryCount {
+            value: Some(GENOME_BUILD.to_string()),
+            count: total_variants,
+        }];
 
         Ok(SummaryReport {
             files_processed: 0,
@@ -215,6 +222,26 @@ impl StatsStore {
         Ok(references)
     }
 
+    pub fn all_non_rsids(&self) -> Result<Vec<ReferenceVariant>> {
+        let conn = self.open_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT rsid, chromosome, position, reference, alternates
+             FROM grch38_non_rsids",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(ReferenceVariant {
+                rsid: row.get(0)?,
+                chromosome: row.get(1)?,
+                position: row.get(2)?,
+                reference: row.get(3)?,
+                alternates: row.get(4)?,
+            });
+        }
+        Ok(out)
+    }
+
     pub fn known_rsids(&self) -> Result<HashSet<i64>> {
         let conn = self.open_connection()?;
         let mut stmt = conn.prepare(
@@ -257,65 +284,77 @@ impl StatsStore {
         Ok(())
     }
 
-    fn collect_category_counts(
-        &self,
-        conn: &Connection,
-        query: &str,
-    ) -> Result<Vec<CategoryCount>> {
-        let mut stmt = conn.prepare(query)?;
-        let mut rows = stmt.query([])?;
-        let mut results = Vec::new();
-        while let Some(row) = rows.next()? {
-            let value: Option<String> = row.get(0)?;
-            let count: i64 = row.get(1)?;
-            results.push(CategoryCount {
-                value,
-                count: count as u64,
-            });
-        }
-        Ok(results)
+    pub fn upsert_non_rsid_in_tx(
+        tx: &Transaction<'_>,
+        snp_name: &str,
+        reference: &ReferenceVariant,
+        source: &str,
+        note: Option<&str>,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO grch38_non_rsids
+                (snp_name, rsid, chromosome, position, reference, alternates, source, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(snp_name) DO UPDATE SET
+                rsid=excluded.rsid,
+                chromosome=excluded.chromosome,
+                position=excluded.position,
+                reference=excluded.reference,
+                alternates=excluded.alternates,
+                source=excluded.source,
+                note=excluded.note",
+            params![
+                snp_name,
+                reference.rsid,
+                reference.chromosome,
+                reference.position,
+                reference.reference,
+                reference.alternates,
+                source,
+                note,
+            ],
+        )?;
+        Ok(())
     }
 }
+
+pub const GENOME_BUILD: &str = "GRCh38";
 
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
-        CREATE TABLE IF NOT EXISTS formats (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL UNIQUE,
-            genome_build TEXT
-        );
         CREATE TABLE IF NOT EXISTS rsid_reference (
             rsid INTEGER PRIMARY KEY,
-            format_id INTEGER NOT NULL DEFAULT 1,
             chromosome TEXT NOT NULL,
             position INTEGER NOT NULL,
             reference TEXT NOT NULL,
-            alternates TEXT NOT NULL,
-            FOREIGN KEY(format_id) REFERENCES formats(id) ON DELETE CASCADE
+            alternates TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS rsid_reference_user (
             rsid INTEGER PRIMARY KEY,
-            format_id INTEGER NOT NULL DEFAULT 1,
             chromosome TEXT NOT NULL,
             position INTEGER NOT NULL,
             reference TEXT NOT NULL,
             alternates TEXT NOT NULL,
-            source TEXT,
-            FOREIGN KEY(format_id) REFERENCES formats(id) ON DELETE CASCADE
+            source TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_rsid_reference_format ON rsid_reference(format_id);
-        CREATE INDEX IF NOT EXISTS idx_rsid_reference_user_format ON rsid_reference_user(format_id);
+        CREATE TABLE IF NOT EXISTS grch38_non_rsids (
+            snp_name TEXT PRIMARY KEY,
+            rsid INTEGER NOT NULL,
+            chromosome TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            reference TEXT NOT NULL,
+            alternates TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'ensembl_grch38',
+            note TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_rsid_reference_pos
+            ON rsid_reference(chromosome, position);
+        CREATE INDEX IF NOT EXISTS idx_grch38_non_rsids_pos
+            ON grch38_non_rsids(chromosome, position);
+        CREATE INDEX IF NOT EXISTS idx_grch38_non_rsids_rsid
+            ON grch38_non_rsids(rsid);
         "#,
-    )?;
-    seed_formats(conn)?;
-    Ok(())
-}
-
-fn seed_formats(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "INSERT OR IGNORE INTO formats (id, name, genome_build) VALUES (?1, ?2, ?3)",
-        params![1_i64, "dynamic_dna", "GRCh38"],
     )?;
     Ok(())
 }

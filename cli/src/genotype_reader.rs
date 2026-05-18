@@ -60,6 +60,33 @@ pub struct RowParser {
     header: Option<Vec<String>>,
     comment_header: Option<Vec<String>>,
     alias_map: HashMap<&'static str, BTreeSet<&'static str>>,
+    /// Illumina GSGT "Final Report": saw `[Header]`, still before `[Data]`.
+    awaiting_data: bool,
+    /// This file is in the Illumina GSGT Final Report (Carigenetics) format.
+    carigenetics: bool,
+}
+
+/// Extract an `rs\d+` id from an Illumina SNP Name
+/// (`BOT-rs1135675`, `rs111647200_ilmndup1`, ...). None if there is no rs id.
+fn extract_rs(name: &str) -> Option<String> {
+    let bytes = name.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        let r = bytes[i];
+        if (r == b'r' || r == b'R')
+            && (bytes[i + 1] == b's' || bytes[i + 1] == b'S')
+            && bytes[i + 2].is_ascii_digit()
+        {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            return Some(format!("rs{}", &name[start..end]));
+        }
+        i += 1;
+    }
+    None
 }
 
 impl RowParser {
@@ -79,6 +106,8 @@ impl RowParser {
             header: None,
             comment_header: None,
             alias_map,
+            awaiting_data: false,
+            carigenetics: false,
         }
     }
 
@@ -89,6 +118,27 @@ impl RowParser {
         }
 
         let trimmed = strip_bom(trimmed);
+
+        // Illumina GSGT Final Report sections.
+        if trimmed.eq_ignore_ascii_case("[Header]") {
+            self.carigenetics = true;
+            self.awaiting_data = true;
+            return Ok(RowOutcome::Ignored);
+        }
+        if trimmed.eq_ignore_ascii_case("[Data]") {
+            self.awaiting_data = false;
+            return Ok(RowOutcome::Ignored);
+        }
+        if self.awaiting_data {
+            // metadata line between [Header] and [Data]
+            return Ok(RowOutcome::Ignored);
+        }
+        // First line after [Data] is the column header.
+        if self.carigenetics && self.header.is_none() {
+            self.header = Some(self.parse_fields(trimmed));
+            return Ok(RowOutcome::Ignored);
+        }
+
         if let Some(prefix) = COMMENT_PREFIXES
             .iter()
             .find(|prefix| trimmed.starts_with(**prefix))
@@ -130,6 +180,42 @@ impl RowParser {
                 continue;
             }
             row_map.insert(normalize_name(&header[idx]), strip_inline_comment(&value));
+        }
+
+        if self.carigenetics {
+            // SNP Name -> rsid via rs\d+ extraction; non-rs probes keep an
+            // empty rsid and resolve downstream by (chrom,pos).
+            let snp_name = row_map
+                .get("snpname")
+                .map(|s| s.as_str())
+                .unwrap_or_default();
+            let rsid = extract_rs(snp_name).unwrap_or_default();
+            let chrom = match row_map.get("chr").or_else(|| row_map.get("chromosome")) {
+                Some(v) if !v.is_empty() && v != "0" => v.clone(),
+                _ => return Ok(RowOutcome::Skipped),
+            };
+            let pos = match row_map.get("position").and_then(|v| v.parse::<i64>().ok()) {
+                Some(p) if p > 0 => p,
+                _ => return Ok(RowOutcome::Skipped),
+            };
+            let a1 = row_map.get("allele1plus").map(|s| s.as_str()).unwrap_or("");
+            let a2 = row_map.get("allele2plus").map(|s| s.as_str()).unwrap_or("");
+            let genotype = if a1.is_empty() && a2.is_empty() {
+                None
+            } else if a1 == "-" || a2 == "-" {
+                Some("--".to_string())
+            } else {
+                Some(format!("{}{}", a1, a2))
+            };
+            return Ok(RowOutcome::Parsed(GenotypeRow {
+                rsid,
+                chrom,
+                pos,
+                genotype,
+                gs: None,
+                baf: None,
+                lrr: None,
+            }));
         }
 
         let rsid = match self.lookup(&row_map, "rsid") {
