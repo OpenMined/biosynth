@@ -122,6 +122,7 @@ fn resolve_sqlite_path(args: &GenotypeToVcfArgs) -> Result<PathBuf> {
     ensure_reference_db(Some(&args.sqlite), args.force_download)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn convert_file(
     input: &Path,
     output_paths: &OutputPaths,
@@ -841,9 +842,7 @@ fn load_reference_map(store: &StatsStore) -> Result<HashMap<i64, ReferenceVarian
     Ok(map)
 }
 
-fn load_position_map(
-    store: &StatsStore,
-) -> Result<HashMap<(String, i64), ReferenceVariant>> {
+fn load_position_map(store: &StatsStore) -> Result<HashMap<(String, i64), ReferenceVariant>> {
     let non_rsids = store.all_non_rsids()?;
     let mut map = HashMap::with_capacity(non_rsids.len());
     for variant in non_rsids {

@@ -135,7 +135,9 @@ impl StatsStore {
             .unwrap_or(0);
 
         let non_rsids: i64 = conn
-            .query_row("SELECT COUNT(*) FROM grch38_non_rsids", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM grch38_non_rsids", [], |row| {
+                row.get(0)
+            })
             .unwrap_or(0);
         let formats_seen = vec![
             CategoryCount {
@@ -314,42 +316,6 @@ impl StatsStore {
         )?;
         Ok(())
     }
-
-    /// Resolve a marker by genomic position. Used by the Illumina/Carigenetics
-    /// path for probes that carry no rs id in the file: user overrides win,
-    /// then the Ensembl-resolved non-rsid table, then the base reference.
-    pub fn resolve_by_position(
-        &self,
-        chromosome: &str,
-        position: i64,
-    ) -> Result<Option<ReferenceVariant>> {
-        let conn = self.open_connection()?;
-        let mut stmt = conn.prepare(
-            "SELECT rsid, chromosome, position, reference, alternates FROM (
-                 SELECT rsid, chromosome, position, reference, alternates, 0 AS pri
-                   FROM rsid_reference_user WHERE chromosome=?1 AND position=?2
-                 UNION ALL
-                 SELECT rsid, chromosome, position, reference, alternates, 1 AS pri
-                   FROM grch38_non_rsids WHERE chromosome=?1 AND position=?2
-                 UNION ALL
-                 SELECT rsid, chromosome, position, reference, alternates, 2 AS pri
-                   FROM rsid_reference WHERE chromosome=?1 AND position=?2
-             ) ORDER BY pri LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![chromosome, position])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some(ReferenceVariant {
-                rsid: row.get(0)?,
-                chromosome: row.get(1)?,
-                position: row.get(2)?,
-                reference: row.get(3)?,
-                alternates: row.get(4)?,
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
 }
 
 pub const GENOME_BUILD: &str = "GRCh38";

@@ -299,10 +299,7 @@ fn illumina_header(num_snps: usize) -> String {
 /// No-call / unknown -> ("-", "-"); 2-char -> (first, last); 1-char -> dup.
 fn split_alleles(genotype: &str) -> (String, String) {
     let g = genotype.trim();
-    if g.is_empty()
-        || g.chars()
-            .all(|c| matches!(c, '-' | '.' | 'N' | 'n' | '0'))
-    {
+    if g.is_empty() || g.chars().all(|c| matches!(c, '-' | '.' | 'N' | 'n' | '0')) {
         return ("-".to_string(), "-".to_string());
     }
     let chars: Vec<char> = g.chars().collect();
@@ -378,11 +375,7 @@ fn write_row(
         }
         SyntheticFormat::Illumina => {
             let (a1, a2) = split_alleles(genotype);
-            let design_ref = design
-                .trim_start_matches('[')
-                .chars()
-                .next()
-                .unwrap_or('N');
+            let design_ref = design.trim_start_matches('[').chars().next().unwrap_or('N');
             let ab1 = ab_code(&a1, design_ref);
             let ab2 = ab_code(&a2, design_ref);
             // Synthetic data is internally consistent on the plus strand;

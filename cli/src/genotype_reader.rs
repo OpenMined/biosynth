@@ -194,10 +194,7 @@ impl RowParser {
                 Some(v) if !v.is_empty() && v != "0" => v.clone(),
                 _ => return Ok(RowOutcome::Skipped),
             };
-            let pos = match row_map
-                .get("position")
-                .and_then(|v| v.parse::<i64>().ok())
-            {
+            let pos = match row_map.get("position").and_then(|v| v.parse::<i64>().ok()) {
                 Some(p) if p > 0 => p,
                 _ => return Ok(RowOutcome::Skipped),
             };
