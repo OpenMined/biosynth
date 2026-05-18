@@ -34,7 +34,7 @@ pub fn run_allele_report(args: AlleleReportArgs) -> Result<()> {
     file.flush()?;
 
     println!(
-        "🧾 RSID coverage report written to {} ({} formats; {} format/rsid rows)",
+        "🧾 RSID coverage report written to {} ({} sources; {} rsid rows)",
         args.output.display(),
         summary.unique_formats,
         summary.total_rows
@@ -53,11 +53,12 @@ impl FormatSummary {
     fn gather(conn: &Connection) -> Result<Self> {
         let unique_formats: i64 = conn
             .query_row(
-                "SELECT COALESCE(COUNT(DISTINCT format_id), 0) FROM rsid_reference",
+                "SELECT 1 + COALESCE((SELECT COUNT(DISTINCT source) \
+                 FROM grch38_non_rsids), 0)",
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or(0);
+            .unwrap_or(1);
         let unique_rsids: i64 = conn
             .query_row(
                 "SELECT COALESCE(COUNT(*), 0) FROM rsid_reference",
@@ -67,7 +68,8 @@ impl FormatSummary {
             .unwrap_or(0);
         let total_rows: i64 = conn
             .query_row(
-                "SELECT COALESCE(COUNT(*), 0) FROM rsid_reference",
+                "SELECT (SELECT COALESCE(COUNT(*),0) FROM rsid_reference) \
+                 + (SELECT COALESCE(COUNT(*),0) FROM grch38_non_rsids)",
                 [],
                 |row| row.get(0),
             )
@@ -134,14 +136,14 @@ fn write_header(file: &mut File, summary: &FormatSummary, args: &AlleleReportArg
   <div class="meta">
     Source database: <strong>{source}</strong><br/>
     Generated at: <strong>{generated_at}</strong><br/>
-    Formats tracked: <strong>{formats}</strong>,
+    Sources tracked: <strong>{formats}</strong>,
     Unique rsids: <strong>{unique_rsids}</strong>,
-    Format/rsid rows: <strong>{total_rows}</strong>
+    Reference rows: <strong>{total_rows}</strong>
   </div>
   <table id="rsid-table">
     <thead>
       <tr>
-        <th data-type="string">Format</th>
+        <th data-type="string">Source</th>
         <th data-type="string">RSID / Marker</th>
         <th data-type="number">Observations</th>
       </tr>
@@ -158,10 +160,11 @@ fn write_header(file: &mut File, summary: &FormatSummary, args: &AlleleReportArg
 
 fn write_table_rows(file: &mut File, conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare(
-        "SELECT f.name as format, rr.rsid, 1 as count
-         FROM rsid_reference rr
-         JOIN formats f ON f.id = rr.format_id
-         ORDER BY f.name ASC, rr.rsid ASC",
+        "SELECT src, rsid, 1 as count FROM (
+             SELECT 'reference' AS src, rsid FROM rsid_reference
+             UNION ALL
+             SELECT source AS src, rsid FROM grch38_non_rsids
+         ) ORDER BY src ASC, rsid ASC",
     )?;
     let mut rows = stmt.query([])?;
     let mut has_rows = false;

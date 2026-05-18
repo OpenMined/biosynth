@@ -49,6 +49,7 @@ pub fn run_genotype_to_vcf(args: GenotypeToVcfArgs) -> Result<()> {
         StatsStore::connect(&sqlite_path)?
     };
     let reference_map = load_reference_map(&store)?;
+    let position_map = load_position_map(&store)?;
 
     let cache_path = args.cache.clone().unwrap_or_else(default_cache_path);
     let cache = if cache_path.exists() {
@@ -79,6 +80,7 @@ pub fn run_genotype_to_vcf(args: GenotypeToVcfArgs) -> Result<()> {
             &input,
             &output_paths,
             &reference_map,
+            &position_map,
             &cache,
             &sample_name,
             &missing_log_path,
@@ -124,6 +126,7 @@ fn convert_file(
     input: &Path,
     output_paths: &OutputPaths,
     reference_map: &HashMap<i64, ReferenceVariant>,
+    position_map: &HashMap<(String, i64), ReferenceVariant>,
     cache: &RsidCache,
     sample_name: &str,
     missing_log_path: &Path,
@@ -176,7 +179,7 @@ fn convert_file(
 
     let results = pool.install(|| {
         rows.par_iter()
-            .map(|row| convert_row(reference_map, cache, row, include_metrics))
+            .map(|row| convert_row(reference_map, position_map, cache, row, include_metrics))
             .collect::<Vec<RowResult>>()
     });
 
@@ -187,15 +190,81 @@ fn convert_file(
     write_vcf_header(&mut writer, sample_name, include_metrics)?;
 
     let mut missing_logger = MissingLogger::new(Some(missing_log_path))?;
+
+    // First pass: accumulate stats/logs; gather emittable rows in order.
+    #[derive(Clone)]
+    struct Emit {
+        key: String,
+        rsid: String,
+        gt: String,
+        line: String,
+    }
+    let mut emits: Vec<Emit> = Vec::with_capacity(results.len());
     for result in results {
         stats.add(&result.stats);
         for message in result.logs {
             missing_logger.log(&message)?;
         }
         if let Some(line) = result.line {
-            writer.write_all(line.as_bytes())?;
+            // Merge identity = same locus AND same variant id. Real
+            // duplicate probes (BOT/BOT2/_ilmndup) share chrom+pos+rsid;
+            // co-located SNP/indel differ by rsid; placeholder rsids
+            // (".") at distinct positions differ by locus.
+            let (chrom, pos) = result.locus.clone().unwrap_or_default();
+            emits.push(Emit {
+                key: format!("{}\t{}\t{}", chrom, pos, result.rsid),
+                rsid: result.rsid,
+                gt: result.gt.unwrap_or_else(|| "./.".to_string()),
+                line,
+            });
         }
     }
+
+    // Duplicate-probe merge: collapse all rows sharing an rsid
+    // (Illumina BOT-/BOT2-/_ilmndup replicates) into one VCF row.
+    //   drop no-calls; remaining concordant -> use it;
+    //   remaining disagree -> no-call + conflict log.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<Emit>> = HashMap::new();
+    for e in emits {
+        if !groups.contains_key(&e.key) {
+            order.push(e.key.clone());
+        }
+        groups.entry(e.key.clone()).or_default().push(e);
+    }
+
+    let mut written = 0usize;
+    for key in order {
+        let members = groups.remove(&key).expect("group present");
+        if members.len() == 1 {
+            writer.write_all(members[0].line.as_bytes())?;
+            written += 1;
+            continue;
+        }
+        let calls: Vec<&Emit> = members.iter().filter(|m| m.gt != "./.").collect();
+        let distinct: std::collections::BTreeSet<&str> =
+            calls.iter().map(|m| m.gt.as_str()).collect();
+        if calls.is_empty() {
+            // all no-call: emit one no-call row
+            writer.write_all(members[0].line.as_bytes())?;
+        } else if distinct.len() == 1 {
+            // concordant (incl. call + dropped no-calls): use the called row
+            writer.write_all(calls[0].line.as_bytes())?;
+        } else {
+            // genuine disagreement: emit no-call, log conflict
+            writer.write_all(force_nocall(&members[0].line).as_bytes())?;
+            let gts: Vec<&str> = calls.iter().map(|m| m.gt.as_str()).collect();
+            missing_logger.log(&format!(
+                "dup_conflict: {} gts=[{}] ({} probes)",
+                members[0].rsid,
+                gts.join(","),
+                members.len()
+            ))?;
+        }
+        written += 1;
+    }
+    // written_rows now reflects merged loci, not raw probe rows.
+    stats.written_rows = written;
 
     writer.flush()?;
     missing_logger.flush()?;
@@ -226,19 +295,43 @@ fn collect_row(
 
 fn convert_row(
     reference_map: &HashMap<i64, ReferenceVariant>,
+    position_map: &HashMap<(String, i64), ReferenceVariant>,
     cache: &RsidCache,
     row: &crate::genotype_reader::GenotypeRow,
     include_metrics: bool,
 ) -> RowResult {
     let mut result = RowResult::default();
-    let rsid_label = row.rsid.trim();
-    if rsid_label.is_empty() {
+    let mut rsid_label = row.rsid.trim().to_string();
+
+    // Resolve ref/alt by rsid first; for Illumina non-rsid probes (empty or
+    // unresolvable rsid) fall back to a (chrom,pos) lookup against the
+    // grch38_non_rsids table.
+    let mut resolved = if rsid_label.is_empty() {
+        None
+    } else {
+        resolve_reference(&rsid_label, reference_map, cache)
+    };
+    if resolved.is_none() {
+        if let Some(pv) = position_map.get(&(row.chrom.clone(), row.pos)) {
+            let alternates = parse_alternates(&pv.alternates);
+            if !pv.reference.is_empty() && !alternates.is_empty() {
+                if rsid_label.is_empty() {
+                    rsid_label = format!("rs{}", pv.rsid);
+                }
+                resolved = Some(ResolvedReference {
+                    reference: normalize_sequence(&pv.reference),
+                    alternates,
+                });
+            }
+        }
+    }
+    if rsid_label.is_empty() && resolved.is_none() {
         result.stats.invalid_rsid += 1;
         result.logs.push("missing_rsid".to_string());
         return result;
     }
+    let rsid_label = rsid_label.as_str();
 
-    let resolved = resolve_reference(rsid_label, reference_map, cache);
     let mut unresolved = false;
     let mut reference = "N".to_string();
     let mut alternates: Vec<String> = Vec::new();
@@ -306,6 +399,9 @@ fn convert_row(
     };
 
     result.stats.written_rows += 1;
+    result.rsid = rsid_label.to_string();
+    result.locus = Some((row.chrom.clone(), row.pos));
+    result.gt = Some(gt_call.clone());
     result.line = Some(format!(
         "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}\t{}\n",
         row.chrom,
@@ -318,6 +414,28 @@ fn convert_row(
         sample_field
     ));
     result
+}
+
+/// Rewrite a VCF data line to a no-call genotype and flag INFO=CONFLICT.
+/// Columns: 0 CHROM 1 POS 2 ID 3 REF 4 ALT 5 QUAL 6 FILTER 7 INFO 8 FORMAT 9 SAMPLE
+fn force_nocall(line: &str) -> String {
+    let trimmed = line.strip_suffix('\n').unwrap_or(line);
+    let mut cols: Vec<String> = trimmed.split('\t').map(|s| s.to_string()).collect();
+    if cols.len() >= 10 {
+        if !cols[7].split(';').any(|f| f == "CONFLICT") {
+            cols[7].push_str(";CONFLICT");
+        }
+        let mut parts = cols[9].split(':');
+        let rest: Vec<&str> = parts.by_ref().skip(1).collect();
+        cols[9] = if rest.is_empty() {
+            "./.".to_string()
+        } else {
+            format!("./.:{}", rest.join(":"))
+        };
+    }
+    let mut out = cols.join("\t");
+    out.push('\n');
+    out
 }
 
 fn resolve_reference(
@@ -537,6 +655,11 @@ struct RowResult {
     line: Option<String>,
     stats: ConversionStats,
     logs: Vec<String>,
+    /// Locus identity for duplicate-probe merging (Illumina BOT/BOT2/ilmndup).
+    rsid: String,
+    locus: Option<(String, i64)>,
+    /// The GT call ("0/0", "0/1", "1/1", "./.") when a line was produced.
+    gt: Option<String>,
 }
 
 struct MissingLogger {
@@ -714,6 +837,17 @@ fn load_reference_map(store: &StatsStore) -> Result<HashMap<i64, ReferenceVarian
     let mut map = HashMap::with_capacity(references.len());
     for reference in references {
         map.insert(reference.rsid, reference);
+    }
+    Ok(map)
+}
+
+fn load_position_map(
+    store: &StatsStore,
+) -> Result<HashMap<(String, i64), ReferenceVariant>> {
+    let non_rsids = store.all_non_rsids()?;
+    let mut map = HashMap::with_capacity(non_rsids.len());
+    for variant in non_rsids {
+        map.insert((variant.chromosome.clone(), variant.position), variant);
     }
     Ok(map)
 }

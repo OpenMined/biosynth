@@ -33,4 +33,5 @@ notebooks/data/*
 data/*.sqlite
 data/*.db
 !data/.gitkeep
-!data/genostats.sqlite
+!data/genostats.sqlitescripts/__pycache__/
+data/genostats.sqlite.bak
