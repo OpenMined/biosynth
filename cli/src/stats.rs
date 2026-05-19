@@ -320,7 +320,78 @@ impl StatsStore {
 
 pub const GENOME_BUILD: &str = "GRCh38";
 
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        params![name],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    if !table_exists(conn, table)? {
+        return Ok(false);
+    }
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Migrate the legacy schema (a `formats` table + `format_id` columns/FK/
+/// indexes) to the current one. Idempotent: a no-op on fresh or
+/// already-current databases. Lets any binary open any cached DB version.
+fn migrate_legacy_schema(conn: &Connection) -> Result<()> {
+    let needs = table_exists(conn, "formats")?
+        || has_column(conn, "rsid_reference", "format_id")?
+        || has_column(conn, "rsid_reference_user", "format_id")?;
+    if !needs {
+        return Ok(());
+    }
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let tx = conn.unchecked_transaction()?;
+    if has_column(&tx, "rsid_reference", "format_id")? {
+        tx.execute_batch(
+            "CREATE TABLE rsid_reference_new (rsid INTEGER PRIMARY KEY,
+                 chromosome TEXT NOT NULL, position INTEGER NOT NULL,
+                 reference TEXT NOT NULL, alternates TEXT NOT NULL);
+             INSERT INTO rsid_reference_new
+                 SELECT rsid, chromosome, position, reference, alternates
+                 FROM rsid_reference;
+             DROP TABLE rsid_reference;
+             ALTER TABLE rsid_reference_new RENAME TO rsid_reference;",
+        )?;
+    }
+    if has_column(&tx, "rsid_reference_user", "format_id")? {
+        tx.execute_batch(
+            "CREATE TABLE rsid_reference_user_new (rsid INTEGER PRIMARY KEY,
+                 chromosome TEXT NOT NULL, position INTEGER NOT NULL,
+                 reference TEXT NOT NULL, alternates TEXT NOT NULL,
+                 source TEXT);
+             INSERT INTO rsid_reference_user_new
+                 SELECT rsid, chromosome, position, reference, alternates,
+                        source FROM rsid_reference_user;
+             DROP TABLE rsid_reference_user;
+             ALTER TABLE rsid_reference_user_new RENAME TO rsid_reference_user;",
+        )?;
+    }
+    tx.execute_batch(
+        "DROP INDEX IF EXISTS idx_rsid_reference_format;
+         DROP INDEX IF EXISTS idx_rsid_reference_user_format;
+         DROP TABLE IF EXISTS formats;",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn init_schema(conn: &Connection) -> Result<()> {
+    migrate_legacy_schema(conn)?;
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS rsid_reference (
