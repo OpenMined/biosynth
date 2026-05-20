@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -89,6 +89,14 @@ pub fn run_synthetic(args: SyntheticArgs) -> Result<()> {
     let overlays = load_overlay_specs(&args)?
         .map(Arc::new)
         .unwrap_or_else(|| Arc::new(Vec::new()));
+    let biallelic_choices = if args.biallelic {
+        Some(Arc::new(build_biallelic_choices(
+            references.as_ref(),
+            overlays.as_ref(),
+        )?))
+    } else {
+        None
+    };
 
     let plans = build_file_plans(&output_template, &args)?;
 
@@ -113,10 +121,14 @@ pub fn run_synthetic(args: SyntheticArgs) -> Result<()> {
                     args.no_call_token.as_str(),
                     plan.seed,
                     args.format,
+                    biallelic_choices.as_ref().map(|choices| choices.as_ref()),
                 )
             })
             .collect::<Result<Vec<_>>>()
     })?;
+    if args.biallelic {
+        validate_biallelic_outputs(&plans, args.format)?;
+    }
 
     let total_rows: usize = results.iter().sum();
     println!(
@@ -158,6 +170,7 @@ fn write_single_file(
     no_call_token: &str,
     seed: Option<u64>,
     format: SyntheticFormat,
+    biallelic_choices: Option<&HashMap<i64, BiallelicChoice>>,
 ) -> Result<usize> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -172,7 +185,7 @@ fn write_single_file(
     let default_frequencies = GenotypeFrequencies::from_alt_frequency(alt_frequency)?;
 
     let mut overlay_assignments =
-        prepare_overlay_assignments(overlays, default_frequencies, &mut rng)?;
+        prepare_overlay_assignments(overlays, default_frequencies, biallelic_choices, &mut rng)?;
 
     let sample_id = path
         .file_stem()
@@ -217,20 +230,22 @@ fn write_single_file(
                 &assignment.spec.chromosome,
                 assignment.spec.position,
                 &genotype,
-                &design_for(
-                    assignment.spec.reference.as_deref(),
-                    &assignment.spec.alternates,
-                    &genotype,
-                ),
+                &design_for_assignment(&assignment, biallelic_choices, &genotype),
                 &mut rng,
             )?;
             written += 1;
             continue;
         }
 
-        let genotype = synthesize_genotype(reference, &default_frequencies, &mut rng);
+        let genotype = synthesize_reference_genotype(
+            reference,
+            &default_frequencies,
+            biallelic_choices,
+            &mut rng,
+        );
         let genotype = apply_no_call(&genotype, no_call_frequency, no_call_token, &mut rng);
-        let alts = parse_alternates(&reference.alternates);
+        let (design_reference, design_alts) =
+            design_parts_for_reference(reference, biallelic_choices);
         write_row(
             &mut writer,
             format,
@@ -239,7 +254,7 @@ fn write_single_file(
             &reference.chromosome,
             reference.position,
             &genotype,
-            &design_for(Some(&reference.reference), &alts, &genotype),
+            &design_for(Some(&design_reference), &design_alts, &genotype),
             &mut rng,
         )
         .with_context(|| format!("write row for rs{}", reference.rsid))?;
@@ -261,11 +276,7 @@ fn write_single_file(
             &assignment.spec.chromosome,
             assignment.spec.position,
             &genotype,
-            &design_for(
-                assignment.spec.reference.as_deref(),
-                &assignment.spec.alternates,
-                &genotype,
-            ),
+            &design_for_assignment(&assignment, biallelic_choices, &genotype),
             &mut rng,
         )?;
         written += 1;
@@ -349,6 +360,91 @@ fn ab_code(allele: &str, design_ref: char) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone)]
+struct BiallelicChoice {
+    reference: String,
+    alternates: Vec<String>,
+}
+
+fn build_biallelic_choices(
+    references: &[ReferenceVariant],
+    overlays: &[OverlaySpec],
+) -> Result<HashMap<i64, BiallelicChoice>> {
+    let mut choices = HashMap::new();
+    for reference in references {
+        choices.insert(
+            reference.rsid,
+            BiallelicChoice {
+                reference: reference.reference.clone(),
+                alternates: first_alternate_only(&reference.alternates),
+            },
+        );
+    }
+    for overlay in overlays {
+        if overlay.genotype_options.is_empty() {
+            let Some(reference) = &overlay.reference else {
+                continue;
+            };
+            choices
+                .entry(overlay.rsid)
+                .or_insert_with(|| BiallelicChoice {
+                    reference: reference.clone(),
+                    alternates: overlay.alternates.first().cloned().into_iter().collect(),
+                });
+        }
+    }
+    Ok(choices)
+}
+
+fn first_alternate_only(alternates: &str) -> Vec<String> {
+    parse_alternates(alternates).into_iter().take(1).collect()
+}
+
+fn synthesize_reference_genotype(
+    reference: &ReferenceVariant,
+    default_frequencies: &GenotypeFrequencies,
+    biallelic_choices: Option<&HashMap<i64, BiallelicChoice>>,
+    rng: &mut StdRng,
+) -> String {
+    if let Some(choice) = biallelic_choices.and_then(|choices| choices.get(&reference.rsid)) {
+        return synthesize_genotype_from_parts(
+            &choice.reference,
+            &choice.alternates,
+            default_frequencies,
+            rng,
+        );
+    }
+    synthesize_genotype(reference, default_frequencies, rng)
+}
+
+fn design_parts_for_reference(
+    reference: &ReferenceVariant,
+    biallelic_choices: Option<&HashMap<i64, BiallelicChoice>>,
+) -> (String, Vec<String>) {
+    if let Some(choice) = biallelic_choices.and_then(|choices| choices.get(&reference.rsid)) {
+        return (choice.reference.clone(), choice.alternates.clone());
+    }
+    (
+        reference.reference.clone(),
+        parse_alternates(&reference.alternates),
+    )
+}
+
+fn design_for_assignment(
+    assignment: &OverlayAssignment,
+    biallelic_choices: Option<&HashMap<i64, BiallelicChoice>>,
+    genotype: &str,
+) -> String {
+    if let Some(choice) = biallelic_choices.and_then(|choices| choices.get(&assignment.spec.rsid)) {
+        return design_for(Some(&choice.reference), &choice.alternates, genotype);
+    }
+    design_for(
+        assignment.spec.reference.as_deref(),
+        &assignment.spec.alternates,
+        genotype,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_row(
     writer: &mut BufWriter<File>,
@@ -427,13 +523,14 @@ fn load_overlay_specs(args: &SyntheticArgs) -> Result<Option<Vec<OverlaySpec>>> 
         }
         let group_freqs = if let Some(raw) = group.genotype_frequencies {
             Some(raw)
+        } else if let Some(alt_frequency) = group.alt_frequency {
+            let frequencies = GenotypeFrequencies::from_alt_frequency(alt_frequency)?;
+            Some(GenotypeFrequenciesRaw {
+                het: frequencies.het,
+                hom_alt: frequencies.hom_alt,
+            })
         } else {
-            group
-                .alt_frequency
-                .map(|alt_frequency| GenotypeFrequenciesRaw {
-                    het: 0.0,
-                    hom_alt: alt_frequency,
-                })
+            None
         };
         for variant in &group.variants {
             let mut variant = variant.clone();
@@ -449,11 +546,16 @@ fn load_overlay_specs(args: &SyntheticArgs) -> Result<Option<Vec<OverlaySpec>>> 
 fn prepare_overlay_assignments(
     overlays: &[OverlaySpec],
     default_frequencies: GenotypeFrequencies,
+    biallelic_choices: Option<&HashMap<i64, BiallelicChoice>>,
     rng: &mut StdRng,
 ) -> Result<HashMap<i64, OverlayAssignment>> {
     let mut assignments: HashMap<i64, OverlayAssignment> = HashMap::new();
     for spec in overlays {
-        let genotype = spec.random_genotype(default_frequencies, rng)?;
+        let genotype = spec.random_genotype(
+            default_frequencies,
+            biallelic_choices.and_then(|choices| choices.get(&spec.rsid)),
+            rng,
+        )?;
         if assignments
             .insert(
                 spec.rsid,
@@ -529,6 +631,7 @@ impl OverlaySpec {
     fn random_genotype(
         &self,
         default_frequencies: GenotypeFrequencies,
+        biallelic_choice: Option<&BiallelicChoice>,
         rng: &mut StdRng,
     ) -> Result<String> {
         if self.genotype_options.is_empty() {
@@ -539,6 +642,14 @@ impl OverlaySpec {
                 Some(raw) => parse_frequencies(raw)?,
                 None => default_frequencies,
             };
+            if let Some(choice) = biallelic_choice {
+                return Ok(synthesize_genotype_from_parts(
+                    &choice.reference,
+                    &choice.alternates,
+                    &frequencies,
+                    rng,
+                ));
+            }
             return Ok(synthesize_genotype_from_parts(
                 reference,
                 &self.alternates,
@@ -660,6 +771,133 @@ fn fill_output_template(
         result = result.replace("{year}", &year.to_string());
     }
     result
+}
+
+fn validate_biallelic_outputs(plans: &[FilePlan], format: SyntheticFormat) -> Result<()> {
+    let mut observed: HashMap<String, HashSet<String>> = HashMap::new();
+    for plan in plans {
+        match format {
+            SyntheticFormat::Ddna => scan_ddna_biallelic(&plan.path, &mut observed)?,
+            SyntheticFormat::Illumina => scan_illumina_biallelic(&plan.path, &mut observed)?,
+        }
+    }
+
+    let violations = observed
+        .iter()
+        .filter(|(_, alleles)| alleles.len() > 2)
+        .map(|(rsid, alleles)| {
+            let mut sorted = alleles.iter().cloned().collect::<Vec<_>>();
+            sorted.sort();
+            format!("{rsid}: {}", sorted.join(","))
+        })
+        .collect::<Vec<_>>();
+    if !violations.is_empty() {
+        bail!(
+            "Biallelic validation failed for {} rsID(s): {}",
+            violations.len(),
+            violations
+                .into_iter()
+                .take(10)
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    Ok(())
+}
+
+fn scan_ddna_biallelic(
+    path: &PathBuf,
+    observed: &mut HashMap<String, HashSet<String>>,
+) -> Result<()> {
+    let file = File::open(path).with_context(|| format!("Open generated DDNA {:?}", path))?;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let fields = trimmed.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 4 {
+            continue;
+        }
+        add_observed_genotype(observed, fields[0], fields[3]);
+    }
+    Ok(())
+}
+
+fn scan_illumina_biallelic(
+    path: &PathBuf,
+    observed: &mut HashMap<String, HashSet<String>>,
+) -> Result<()> {
+    let file = File::open(path).with_context(|| format!("Open generated Illumina {:?}", path))?;
+    let mut in_data = false;
+    let mut header: Option<HashMap<String, usize>> = None;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("[Data]") {
+            in_data = true;
+            continue;
+        }
+        if !in_data || trimmed.is_empty() {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if header.is_none() {
+            header = Some(
+                fields
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, name)| (name.trim().to_string(), idx))
+                    .collect(),
+            );
+            continue;
+        }
+        let header = header.as_ref().expect("header must be set");
+        let Some(snp_idx) = header.get("SNP Name") else {
+            continue;
+        };
+        let Some(a1_idx) = header.get("Allele1 - Plus") else {
+            continue;
+        };
+        let Some(a2_idx) = header.get("Allele2 - Plus") else {
+            continue;
+        };
+        let Some(rsid) = fields.get(*snp_idx).map(|value| value.trim()) else {
+            continue;
+        };
+        if rsid.is_empty() {
+            continue;
+        }
+        if let Some(a1) = fields.get(*a1_idx) {
+            add_observed_allele(observed, rsid, a1);
+        }
+        if let Some(a2) = fields.get(*a2_idx) {
+            add_observed_allele(observed, rsid, a2);
+        }
+    }
+    Ok(())
+}
+
+fn add_observed_genotype(
+    observed: &mut HashMap<String, HashSet<String>>,
+    rsid: &str,
+    genotype: &str,
+) {
+    let (a1, a2) = split_alleles(genotype);
+    add_observed_allele(observed, rsid, &a1);
+    add_observed_allele(observed, rsid, &a2);
+}
+
+fn add_observed_allele(observed: &mut HashMap<String, HashSet<String>>, rsid: &str, allele: &str) {
+    let allele = allele.trim();
+    if allele.is_empty() || matches!(allele, "-" | "." | "N" | "n" | "0") {
+        return;
+    }
+    observed
+        .entry(rsid.to_string())
+        .or_default()
+        .insert(allele.to_ascii_uppercase());
 }
 
 #[derive(Debug, Deserialize)]
@@ -893,7 +1131,15 @@ struct GenotypeFrequencies {
 
 impl GenotypeFrequencies {
     fn from_alt_frequency(alt_frequency: f64) -> Result<Self> {
-        Self::from_parts(0.0, alt_frequency)
+        if !(0.0..=1.0).contains(&alt_frequency) {
+            bail!("--alt-frequency must be between 0 and 1");
+        }
+        let ref_frequency = 1.0 - alt_frequency;
+        Ok(Self {
+            hom_ref: ref_frequency * ref_frequency,
+            het: 2.0 * ref_frequency * alt_frequency,
+            hom_alt: alt_frequency * alt_frequency,
+        })
     }
 
     fn from_parts(het: f64, hom_alt: f64) -> Result<Self> {
@@ -920,4 +1166,104 @@ enum GenotypeKind {
     HomRef,
     Het,
     HomAlt,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_het(genotype: &str) -> bool {
+        let mut chars = genotype.chars();
+        match (chars.next(), chars.next(), chars.next()) {
+            (Some(a), Some(b), None) => a != b,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn alt_frequency_is_interpreted_as_hwe_allele_frequency() {
+        let frequencies = GenotypeFrequencies::from_alt_frequency(0.2).unwrap();
+
+        assert!((frequencies.hom_ref - 0.64).abs() < 1e-12);
+        assert!((frequencies.het - 0.32).abs() < 1e-12);
+        assert!((frequencies.hom_alt - 0.04).abs() < 1e-12);
+    }
+
+    #[test]
+    fn synthesized_genotypes_have_expected_hwe_heterozygote_rate() {
+        let frequencies = GenotypeFrequencies::from_alt_frequency(0.5).unwrap();
+        let alternates = vec!["G".to_string()];
+        let mut rng = StdRng::seed_from_u64(42);
+        let sample_count = 20_000usize;
+
+        let mut het_count = 0usize;
+        let mut hom_alt_count = 0usize;
+        for _ in 0..sample_count {
+            let genotype = synthesize_genotype_from_parts("A", &alternates, &frequencies, &mut rng);
+            if is_het(&genotype) {
+                het_count += 1;
+            }
+            if genotype == "GG" {
+                hom_alt_count += 1;
+            }
+        }
+
+        let het_rate = het_count as f64 / sample_count as f64;
+        let hom_alt_rate = hom_alt_count as f64 / sample_count as f64;
+        assert!(
+            (het_rate - 0.5).abs() < 0.03,
+            "het_rate {het_rate} should be close to 0.5"
+        );
+        assert!(
+            (hom_alt_rate - 0.25).abs() < 0.03,
+            "hom_alt_rate {hom_alt_rate} should be close to 0.25"
+        );
+    }
+
+    #[test]
+    fn explicit_overlay_genotypes_override_sampled_frequencies() {
+        let overlay = OverlaySpec {
+            rsid: 123,
+            chromosome: "1".to_string(),
+            position: 456,
+            genotype_options: vec!["TT".to_string()],
+            reference: None,
+            alternates: Vec::new(),
+            genotype_frequencies: None,
+        };
+        let default_frequencies = GenotypeFrequencies::from_alt_frequency(0.0).unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+
+        assert_eq!(
+            overlay
+                .random_genotype(default_frequencies, None, &mut rng)
+                .unwrap(),
+            "TT"
+        );
+    }
+
+    #[test]
+    fn biallelic_choice_limits_multiallelic_reference_to_first_alt() {
+        let reference = ReferenceVariant {
+            rsid: 9701872,
+            chromosome: "1".to_string(),
+            position: 632828,
+            reference: "T".to_string(),
+            alternates: "C,G".to_string(),
+        };
+        let choices = build_biallelic_choices(std::slice::from_ref(&reference), &[]).unwrap();
+        let frequencies = GenotypeFrequencies::from_alt_frequency(1.0).unwrap();
+        let mut rng = StdRng::seed_from_u64(1);
+
+        let genotype =
+            synthesize_reference_genotype(&reference, &frequencies, Some(&choices), &mut rng);
+
+        assert_eq!(genotype, "CC");
+        let (design_reference, design_alts) =
+            design_parts_for_reference(&reference, Some(&choices));
+        assert_eq!(
+            design_for(Some(&design_reference), &design_alts, &genotype),
+            "[T/C]"
+        );
+    }
 }

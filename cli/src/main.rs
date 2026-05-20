@@ -335,12 +335,15 @@ pub struct SyntheticArgs {
     /// Output file to write
     #[arg(long)]
     pub output: PathBuf,
-    /// Probability of substituting a random ALT allele instead of the reference.
+    /// ALT allele frequency used to sample diploid genotypes under Hardy-Weinberg equilibrium.
     #[arg(long, default_value = "0.01")]
     pub alt_frequency: f64,
     /// Probability of emitting a no-call genotype ("--") for a row.
     #[arg(long, default_value = "0.0")]
     pub no_call_frequency: f64,
+    /// Constrain each rsID to one cohort-level biallelic allele pair.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub biallelic: bool,
     /// Genotype token used for no-call rows (e.g. "--" or ".").
     #[arg(long, default_value = "--")]
     pub no_call_token: String,
