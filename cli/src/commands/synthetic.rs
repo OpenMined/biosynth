@@ -185,6 +185,7 @@ fn write_single_file(
         Some(seed) => StdRng::seed_from_u64(seed),
         None => StdRng::from_entropy(),
     };
+    let mut forced_no_call_emitted = false;
     let default_frequencies = GenotypeFrequencies::from_alt_frequency(alt_frequency)?;
 
     let mut overlay_assignments =
@@ -234,6 +235,7 @@ fn write_single_file(
                 biallelic_choices,
                 &sample_id,
                 &mut rng,
+                &mut forced_no_call_emitted,
             );
         }
     }
@@ -247,6 +249,8 @@ fn write_single_file(
                 no_call_token,
                 &mut rng,
             );
+            let genotype =
+                force_first_no_call(genotype, no_call_token, &mut forced_no_call_emitted);
             write_row(
                 &mut writer,
                 format,
@@ -270,6 +274,7 @@ fn write_single_file(
             &mut rng,
         );
         let genotype = apply_no_call(&genotype, no_call_frequency, no_call_token, &mut rng);
+        let genotype = force_first_no_call(genotype, no_call_token, &mut forced_no_call_emitted);
         let (design_reference, design_alts) =
             design_parts_for_reference(reference, biallelic_choices);
         write_row(
@@ -295,6 +300,7 @@ fn write_single_file(
             no_call_token,
             &mut rng,
         );
+        let genotype = force_first_no_call(genotype, no_call_token, &mut forced_no_call_emitted);
         write_row(
             &mut writer,
             format,
@@ -347,6 +353,7 @@ fn write_illumina_manifest_file(
     biallelic_choices: Option<&HashMap<i64, BiallelicChoice>>,
     sample_id: &str,
     rng: &mut StdRng,
+    forced_no_call_emitted: &mut bool,
 ) -> Result<usize> {
     let references_by_rsid = references
         .iter()
@@ -400,6 +407,7 @@ fn write_illumina_manifest_file(
             synthesize_genotype_from_design(&probe.design, default_frequencies, rng)
         };
         let genotype = apply_no_call(&genotype, no_call_frequency, no_call_token, rng);
+        let genotype = force_first_no_call(genotype, no_call_token, forced_no_call_emitted);
 
         write_row(
             writer,
@@ -434,6 +442,7 @@ fn write_illumina_manifest_file(
             synthesize_reference_genotype(reference, default_frequencies, biallelic_choices, rng)
         };
         let genotype = apply_no_call(&genotype, no_call_frequency, no_call_token, rng);
+        let genotype = force_first_no_call(genotype, no_call_token, forced_no_call_emitted);
         let (design_reference, design_alts) =
             design_parts_for_reference(reference, biallelic_choices);
         let design = design_for(Some(&design_reference), &design_alts, &genotype);
@@ -458,6 +467,7 @@ fn write_illumina_manifest_file(
             continue;
         }
         let genotype = apply_no_call(&assignment.genotype, no_call_frequency, no_call_token, rng);
+        let genotype = force_first_no_call(genotype, no_call_token, forced_no_call_emitted);
         let rsid_label = format!("rs{}", assignment.spec.rsid);
         write_row(
             writer,
@@ -527,6 +537,14 @@ fn resolve_probe_rsid(
                     .copied()
             })
     })
+}
+
+fn force_first_no_call(genotype: String, no_call_token: &str, emitted: &mut bool) -> String {
+    if *emitted {
+        return genotype;
+    }
+    *emitted = true;
+    no_call_token.to_string()
 }
 
 /// Split a synthetic genotype string into two single-token alleles.
@@ -683,6 +701,19 @@ fn write_row(
 ) -> Result<()> {
     match format {
         SyntheticFormat::Ddna => {
+            let is_no_call = genotype
+                .trim()
+                .chars()
+                .all(|c| matches!(c, '-' | '.' | 'N' | 'n' | '0'));
+            if is_no_call {
+                let lrr = rng.gen_range(-1.5..=0.5);
+                return writeln!(
+                    writer,
+                    "{}\t{}\t{}\t{}\t0\t0\t{:.4}",
+                    rsid_label, chromosome, position, genotype, lrr
+                )
+                .with_context(|| format!("write row for {}", rsid_label));
+            }
             let gs = rng.gen_range(0.2..=1.0);
             let baf = rng.gen_range(0.0..=1.0);
             let lrr = rng.gen_range(-0.5..=0.5);
