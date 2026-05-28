@@ -124,6 +124,7 @@ pub fn run_synthetic(args: SyntheticArgs) -> Result<()> {
                     args.format,
                     biallelic_choices.as_ref().map(|choices| choices.as_ref()),
                     illumina_manifest.as_ref().map(|manifest| manifest.as_ref()),
+                    args.qc_edge_cases,
                 )
             })
             .collect::<Result<Vec<_>>>()
@@ -174,6 +175,7 @@ fn write_single_file(
     format: SyntheticFormat,
     biallelic_choices: Option<&HashMap<i64, BiallelicChoice>>,
     illumina_manifest: Option<&IlluminaProbeManifest>,
+    qc_edge_cases: bool,
 ) -> Result<usize> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -215,6 +217,11 @@ fn write_single_file(
                     .count();
                 references.len() + extra
             };
+            let num_snps = if qc_edge_cases {
+                num_snps + ILLUMINA_QC_EDGE_CASES.len()
+            } else {
+                num_snps
+            };
             writer
                 .write_all(illumina_header(num_snps).as_bytes())
                 .context("write header")?;
@@ -236,6 +243,7 @@ fn write_single_file(
                 &sample_id,
                 &mut rng,
                 &mut forced_no_call_emitted,
+                qc_edge_cases,
             );
         }
     }
@@ -316,6 +324,10 @@ fn write_single_file(
         written += 1;
     }
 
+    if qc_edge_cases {
+        written += write_qc_edge_cases(&mut writer, format, &sample_id)?;
+    }
+
     writer.flush()?;
     Ok(written)
 }
@@ -354,6 +366,7 @@ fn write_illumina_manifest_file(
     sample_id: &str,
     rng: &mut StdRng,
     forced_no_call_emitted: &mut bool,
+    qc_edge_cases: bool,
 ) -> Result<usize> {
     let references_by_rsid = references
         .iter()
@@ -484,6 +497,10 @@ fn write_illumina_manifest_file(
         written += 1;
     }
 
+    if qc_edge_cases {
+        written += write_qc_edge_cases(writer, SyntheticFormat::Illumina, sample_id)?;
+    }
+
     writer.flush()?;
     Ok(written)
 }
@@ -598,6 +615,140 @@ fn ab_code(allele: &str, design_ref: char) -> &'static str {
         Some(c) if c == design_ref => "A",
         Some(_) => "B",
         None => "-",
+    }
+}
+
+struct DdnaQcEdgeCase {
+    rsid: &'static str,
+    chromosome: &'static str,
+    position: i64,
+    genotype: &'static str,
+    gs: &'static str,
+    baf: &'static str,
+    lrr: &'static str,
+}
+
+struct IlluminaQcEdgeCase {
+    snp_name: &'static str,
+    design: &'static str,
+    chromosome: &'static str,
+    position: i64,
+    allele1: &'static str,
+    allele2: &'static str,
+}
+
+const DDNA_QC_EDGE_CASES: &[DdnaQcEdgeCase] = &[
+    DdnaQcEdgeCase {
+        rsid: "rs900000001",
+        chromosome: "1",
+        position: 900000001,
+        genotype: "II",
+        gs: "0.3333",
+        baf: "0.0220",
+        lrr: "-0.3294",
+    },
+    DdnaQcEdgeCase {
+        rsid: "rs900000002",
+        chromosome: "1",
+        position: 900000002,
+        genotype: "--",
+        gs: "0.0000",
+        baf: "NaN",
+        lrr: "NaN",
+    },
+    DdnaQcEdgeCase {
+        rsid: "rs900000003",
+        chromosome: "6",
+        position: 900000003,
+        genotype: "--",
+        gs: "NaN",
+        baf: "NaN",
+        lrr: "NaN",
+    },
+    DdnaQcEdgeCase {
+        rsid: ".",
+        chromosome: "1",
+        position: 900000004,
+        genotype: "DD",
+        gs: "0.4630",
+        baf: "0.0000",
+        lrr: "-0.0143",
+    },
+    DdnaQcEdgeCase {
+        rsid: ".",
+        chromosome: "1",
+        position: 900000005,
+        genotype: "TT",
+        gs: "0.4222",
+        baf: "0.9976",
+        lrr: "-0.0408",
+    },
+];
+
+const ILLUMINA_QC_EDGE_CASES: &[IlluminaQcEdgeCase] = &[
+    IlluminaQcEdgeCase {
+        snp_name: "BV_QC_UNMAPPED_0_0",
+        design: "[A/C]",
+        chromosome: "0",
+        position: 0,
+        allele1: "C",
+        allele2: "C",
+    },
+    IlluminaQcEdgeCase {
+        snp_name: "BV_QC_INDEL_I_D",
+        design: "[I/D]",
+        chromosome: "1",
+        position: 900000006,
+        allele1: "I",
+        allele2: "I",
+    },
+];
+
+fn write_qc_edge_cases(
+    writer: &mut BufWriter<File>,
+    format: SyntheticFormat,
+    sample_id: &str,
+) -> Result<usize> {
+    match format {
+        SyntheticFormat::Ddna => {
+            for row in DDNA_QC_EDGE_CASES {
+                writeln!(
+                    writer,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    row.rsid, row.chromosome, row.position, row.genotype, row.gs, row.baf, row.lrr
+                )
+                .with_context(|| format!("write QC edge-case row for {}", row.rsid))?;
+            }
+            Ok(DDNA_QC_EDGE_CASES.len())
+        }
+        SyntheticFormat::Illumina => {
+            for row in ILLUMINA_QC_EDGE_CASES {
+                let design_ref = row
+                    .design
+                    .trim_start_matches('[')
+                    .chars()
+                    .next()
+                    .unwrap_or('N');
+                let ab1 = ab_code(row.allele1, design_ref);
+                let ab2 = ab_code(row.allele2, design_ref);
+                writeln!(
+                    writer,
+                    "{sid}\t\t{snp}\t{design}\t{chr}\t{pos}\t\
+                     {a1}\t{a2}\t{a1}\t{a2}\t{a1}\t{a2}\t{a1}\t{a2}\t{ab1}\t{ab2}\t+",
+                    sid = sample_id,
+                    snp = row.snp_name,
+                    design = row.design,
+                    chr = row.chromosome,
+                    pos = row.position,
+                    a1 = row.allele1,
+                    a2 = row.allele2,
+                    ab1 = ab1,
+                    ab2 = ab2,
+                )
+                .with_context(|| format!("write QC edge-case row for {}", row.snp_name))?;
+            }
+            Ok(ILLUMINA_QC_EDGE_CASES.len())
+        }
     }
 }
 

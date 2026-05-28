@@ -368,6 +368,9 @@ pub struct SyntheticArgs {
     /// Disable realistic Illumina probe names and emit clean rsid SNP Name values.
     #[arg(long = "clean-illumina-rsids", action = ArgAction::SetTrue)]
     pub clean_illumina_rsids: bool,
+    /// Append deterministic QC edge-case rows observed in real DDNA/Illumina files.
+    #[arg(long = "qc-edge-cases", action = ArgAction::SetTrue)]
+    pub qc_edge_cases: bool,
     /// Inline JSON describing overlay variants (use instead of --variants-file).
     #[arg(long = "variants-json")]
     pub variants_json: Option<String>,
