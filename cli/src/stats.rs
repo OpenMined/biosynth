@@ -19,6 +19,15 @@ pub struct ReferenceVariant {
 }
 
 #[derive(Debug, Clone)]
+pub struct IlluminaProbeRecord {
+    pub probe_id: String,
+    pub rsid: Option<i64>,
+    pub design: String,
+    pub chromosome: String,
+    pub position: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct StatsStore {
     sqlite_path: PathBuf,
     read_only: bool,
@@ -242,6 +251,44 @@ impl StatsStore {
         Ok(out)
     }
 
+    pub fn all_illumina_probe_manifest(&self) -> Result<Vec<IlluminaProbeRecord>> {
+        let conn = self.open_connection()?;
+        if !table_exists(&conn, "illumina_probe_manifest")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn.prepare(
+            "SELECT probe_id, rsid, design, chromosome, position
+             FROM illumina_probe_manifest
+             ORDER BY row_order",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(IlluminaProbeRecord {
+                probe_id: row.get(0)?,
+                rsid: row.get(1)?,
+                design: row.get(2)?,
+                chromosome: row.get(3)?,
+                position: row.get(4)?,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn all_illumina_clean_rsids(&self) -> Result<HashSet<i64>> {
+        let conn = self.open_connection()?;
+        if !table_exists(&conn, "illumina_clean_rsids")? {
+            return Ok(HashSet::new());
+        }
+        let mut stmt = conn.prepare("SELECT rsid FROM illumina_clean_rsids")?;
+        let mut rows = stmt.query([])?;
+        let mut rsids = HashSet::new();
+        while let Some(row) = rows.next()? {
+            rsids.insert(row.get(0)?);
+        }
+        Ok(rsids)
+    }
+
     pub fn known_rsids(&self) -> Result<HashSet<i64>> {
         let conn = self.open_connection()?;
         let mut stmt = conn.prepare(
@@ -419,12 +466,27 @@ fn init_schema(conn: &Connection) -> Result<()> {
             source TEXT NOT NULL DEFAULT 'ensembl_grch38',
             note TEXT
         );
+        CREATE TABLE IF NOT EXISTS illumina_probe_manifest (
+            row_order INTEGER PRIMARY KEY,
+            probe_id TEXT NOT NULL,
+            rsid INTEGER,
+            design TEXT NOT NULL,
+            chromosome TEXT NOT NULL,
+            position INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS illumina_clean_rsids (
+            rsid INTEGER PRIMARY KEY
+        );
         CREATE INDEX IF NOT EXISTS idx_rsid_reference_pos
             ON rsid_reference(chromosome, position);
         CREATE INDEX IF NOT EXISTS idx_grch38_non_rsids_pos
             ON grch38_non_rsids(chromosome, position);
         CREATE INDEX IF NOT EXISTS idx_grch38_non_rsids_rsid
             ON grch38_non_rsids(rsid);
+        CREATE INDEX IF NOT EXISTS idx_illumina_probe_manifest_rsid
+            ON illumina_probe_manifest(rsid);
+        CREATE INDEX IF NOT EXISTS idx_illumina_probe_manifest_pos
+            ON illumina_probe_manifest(chromosome, position);
         "#,
     )?;
     Ok(())

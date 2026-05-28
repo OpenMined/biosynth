@@ -362,6 +362,12 @@ pub struct SyntheticArgs {
     /// Optional JSON file describing overlay variants to force/include.
     #[arg(long = "variants-file")]
     pub variants_file: Option<PathBuf>,
+    /// Optional Illumina probe manifest TSV with probe_id, rsid, design, chrom, pos columns.
+    #[arg(long = "illumina-probe-manifest")]
+    pub illumina_probe_manifest: Option<PathBuf>,
+    /// Disable realistic Illumina probe names and emit clean rsid SNP Name values.
+    #[arg(long = "clean-illumina-rsids", action = ArgAction::SetTrue)]
+    pub clean_illumina_rsids: bool,
     /// Inline JSON describing overlay variants (use instead of --variants-file).
     #[arg(long = "variants-json")]
     pub variants_json: Option<String>,
