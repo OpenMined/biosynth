@@ -268,6 +268,11 @@ pub struct FastAlleleFreqArgs {
     /// Worker threads for parsing (0 = auto/all cores).
     #[arg(long, default_value = "0")]
     pub threads: usize,
+    /// Soft cap on memory (GB): reduces threads to fit. 0 = auto (80% of detected
+    /// available RAM, honoring container cgroup limits). Peak RAM is roughly
+    /// threads x panel size; this bounds it. Set a number to hard-cap (e.g. 18).
+    #[arg(long, default_value = "0")]
+    pub max_ram_gb: f64,
 }
 
 #[derive(Args, Clone)]

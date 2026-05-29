@@ -52,3 +52,57 @@ fn is_candidate_file(path: &Path) -> bool {
     }
     true
 }
+
+/// Best-effort available memory in bytes, used to auto-size RAM budgets.
+/// Honors container limits (cgroups v2/v1) first, then host memory
+/// (`/proc/meminfo` on Linux, `sysctl hw.memsize` on macOS). None if unknown.
+pub fn available_memory_bytes() -> Option<u64> {
+    // cgroups v2 (container memory limit)
+    if let Ok(value) = fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        let trimmed = value.trim();
+        if trimmed != "max" {
+            if let Ok(bytes) = trimmed.parse::<u64>() {
+                if bytes > 0 {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+    // cgroups v1
+    if let Ok(value) = fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        if let Ok(bytes) = value.trim().parse::<u64>() {
+            // v1 uses a huge sentinel when unlimited; ignore implausibly large values.
+            if bytes > 0 && bytes < (1u64 << 62) {
+                return Some(bytes);
+            }
+        }
+    }
+    // Linux host: MemAvailable
+    if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
+        for line in meminfo.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                if let Some(kb) = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    return Some(kb * 1024);
+                }
+            }
+        }
+    }
+    // macOS: total physical memory via sysctl
+    if let Ok(output) = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+    {
+        if let Ok(text) = String::from_utf8(output.stdout) {
+            if let Ok(bytes) = text.trim().parse::<u64>() {
+                if bytes > 0 {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+    None
+}
