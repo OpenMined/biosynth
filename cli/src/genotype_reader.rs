@@ -4,7 +4,7 @@ use anyhow::Result;
 
 const COMMENT_PREFIXES: [&str; 2] = ["#", "//"];
 
-const RSID_ALIASES: &[&str] = &["rsid", "name", "snp", "marker", "id", "snpid"];
+const RSID_ALIASES: &[&str] = &["rsid", "name", "snp", "marker", "id", "snpid", "snpname"];
 const CHROM_ALIASES: &[&str] = &["chromosome", "chr", "chrom"];
 const POSITION_ALIASES: &[&str] = &[
     "position",
@@ -182,40 +182,8 @@ impl RowParser {
             row_map.insert(normalize_name(&header[idx]), strip_inline_comment(&value));
         }
 
-        if self.carigenetics {
-            // SNP Name -> rsid via rs\d+ extraction; non-rs probes keep an
-            // empty rsid and resolve downstream by (chrom,pos).
-            let snp_name = row_map
-                .get("snpname")
-                .map(|s| s.as_str())
-                .unwrap_or_default();
-            let rsid = extract_rs(snp_name).unwrap_or_default();
-            let chrom = match row_map.get("chr").or_else(|| row_map.get("chromosome")) {
-                Some(v) if !v.is_empty() && v != "0" => v.clone(),
-                _ => return Ok(RowOutcome::Skipped),
-            };
-            let pos = match row_map.get("position").and_then(|v| v.parse::<i64>().ok()) {
-                Some(p) if p > 0 => p,
-                _ => return Ok(RowOutcome::Skipped),
-            };
-            let a1 = row_map.get("allele1plus").map(|s| s.as_str()).unwrap_or("");
-            let a2 = row_map.get("allele2plus").map(|s| s.as_str()).unwrap_or("");
-            let genotype = if a1.is_empty() && a2.is_empty() {
-                None
-            } else if a1 == "-" || a2 == "-" {
-                Some("--".to_string())
-            } else {
-                Some(format!("{}{}", a1, a2))
-            };
-            return Ok(RowOutcome::Parsed(GenotypeRow {
-                rsid,
-                chrom,
-                pos,
-                genotype,
-                gs: None,
-                baf: None,
-                lrr: None,
-            }));
+        if self.carigenetics || looks_like_illumina_row(&row_map) {
+            return Ok(parse_illumina_row(&row_map).unwrap_or(RowOutcome::Skipped));
         }
 
         let rsid = match self.lookup(&row_map, "rsid") {
@@ -223,7 +191,7 @@ impl RowParser {
             _ => return Ok(RowOutcome::Skipped),
         };
         let chrom = match self.lookup(&row_map, "chromosome") {
-            Some(value) if !value.is_empty() => value,
+            Some(value) if !value.is_empty() => clean_chrom(&value),
             _ => return Ok(RowOutcome::Skipped),
         };
         let pos = match self
@@ -369,6 +337,68 @@ fn split_csv_line(line: &str) -> Vec<String> {
     fields
 }
 
+fn looks_like_illumina_row(row_map: &HashMap<String, String>) -> bool {
+    row_map.contains_key("snpname")
+        && row_map
+            .get("chr")
+            .or_else(|| row_map.get("chromosome"))
+            .is_some()
+        && row_map.get("position").is_some()
+        && (row_map.get("allele1plus").is_some() || row_map.get("allele2plus").is_some())
+}
+
+fn parse_illumina_row(row_map: &HashMap<String, String>) -> Option<RowOutcome> {
+    // SNP Name -> rsid via rs\d+ extraction; non-rs probes keep an empty rsid
+    // and resolve downstream by (chrom,pos).
+    let snp_name = row_map
+        .get("snpname")
+        .map(|s| s.as_str())
+        .unwrap_or_default();
+    let rsid = extract_rs(snp_name).unwrap_or_default();
+    let chrom = match row_map.get("chr").or_else(|| row_map.get("chromosome")) {
+        Some(v) if !v.is_empty() => clean_chrom(v),
+        _ => return Some(RowOutcome::Skipped),
+    };
+    if chrom == "0" {
+        return Some(RowOutcome::Skipped);
+    }
+    let pos = match row_map.get("position").and_then(|v| v.parse::<i64>().ok()) {
+        Some(p) if p > 0 => p,
+        _ => return Some(RowOutcome::Skipped),
+    };
+    let a1 = row_map.get("allele1plus").map(|s| s.as_str()).unwrap_or("");
+    let a2 = row_map.get("allele2plus").map(|s| s.as_str()).unwrap_or("");
+    let genotype = if a1.is_empty() && a2.is_empty() {
+        None
+    } else if is_no_call_allele(a1) || is_no_call_allele(a2) {
+        Some("--".to_string())
+    } else {
+        Some(format!("{}{}", a1.trim(), a2.trim()))
+    };
+    Some(RowOutcome::Parsed(GenotypeRow {
+        rsid,
+        chrom,
+        pos,
+        genotype,
+        gs: None,
+        baf: None,
+        lrr: None,
+    }))
+}
+
+fn clean_chrom(value: &str) -> String {
+    let chrom = value.trim();
+    chrom
+        .strip_prefix("chr")
+        .or_else(|| chrom.strip_prefix("CHR"))
+        .unwrap_or(chrom)
+        .to_ascii_uppercase()
+}
+
+fn is_no_call_allele(value: &str) -> bool {
+    matches!(value.trim(), "" | "-" | "." | "N" | "n" | "0")
+}
+
 fn normalize_name(name: &str) -> String {
     name.chars()
         .filter(|c| !matches!(c, ' ' | '\t' | '-' | '_'))
@@ -389,4 +419,47 @@ fn strip_inline_comment(value: &str) -> String {
 
 fn strip_bom(value: &str) -> &str {
     value.strip_prefix('\u{feff}').unwrap_or(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_sectionless_illumina_rows() {
+        let mut parser = RowParser::new(Delimiter::Tab);
+        assert!(matches!(
+            parser
+                .consume_line("SNP Name\tSNP\tChr\tPosition\tAllele1 - Plus\tAllele2 - Plus")
+                .unwrap(),
+            RowOutcome::Ignored
+        ));
+        let row = match parser
+            .consume_line("BOT-rs1135675\t[A/G]\tchr1\t100\tA\tG")
+            .unwrap()
+        {
+            RowOutcome::Parsed(row) => row,
+            _ => panic!("expected parsed row"),
+        };
+        assert_eq!(row.rsid, "rs1135675");
+        assert_eq!(row.chrom, "1");
+        assert_eq!(row.pos, 100);
+        assert_eq!(row.genotype.as_deref(), Some("AG"));
+    }
+
+    #[test]
+    fn keeps_illumina_non_rsid_probe_resolvable_by_position() {
+        let mut parser = RowParser::new(Delimiter::Tab);
+        parser
+            .consume_line("SNP Name\tSNP\tChr\tPosition\tAllele1 - Plus\tAllele2 - Plus")
+            .unwrap();
+        let row = match parser.consume_line("CNV_123\t.\t2\t200\t-\tA").unwrap() {
+            RowOutcome::Parsed(row) => row,
+            _ => panic!("expected parsed row"),
+        };
+        assert_eq!(row.rsid, "");
+        assert_eq!(row.chrom, "2");
+        assert_eq!(row.pos, 200);
+        assert_eq!(row.genotype.as_deref(), Some("--"));
+    }
 }
