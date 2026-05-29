@@ -14,6 +14,7 @@ mod util;
 use crate::commands::allele_report::run_allele_report;
 use crate::commands::fast_allele_freq::run_fast_allele_freq;
 use crate::commands::fst::run_fst;
+use crate::commands::cohort_bed::run_cohort_bed;
 use crate::commands::genostats::run_genostats;
 use crate::commands::genotype_to_vcf::run_genotype_to_vcf;
 use crate::commands::list_missing_cache::run_list_missing_cache;
@@ -32,6 +33,7 @@ use crate::commands::update::run_update;
 mod commands {
     pub mod allele_report;
     pub mod fast_allele_freq;
+    pub mod cohort_bed;
     pub mod fst;
     pub mod genostats;
     pub mod genotype_to_vcf;
@@ -72,6 +74,8 @@ enum Commands {
     FastAlleleFreq(FastAlleleFreqArgs),
     /// Pairwise Weir & Cockerham 1984 FST matrix from merged allele freq/number.
     Fst(FstArgs),
+    /// Build a cohort PLINK .bed/.bim/.fam from genotype files (for PCA/QC).
+    CohortBed(CohortBedArgs),
     /// Inner-join per-population allele frequency TSVs into merged matrices.
     MergeAlleleFreq(MergeAlleleFreqArgs),
     /// Convert a .bvlr file into TSV for debugging.
@@ -273,6 +277,19 @@ pub struct FastAlleleFreqArgs {
     /// threads x panel size; this bounds it. Set a number to hard-cap (e.g. 18).
     #[arg(long, default_value = "0")]
     pub max_ram_gb: f64,
+}
+
+#[derive(Args, Clone)]
+pub struct CohortBedArgs {
+    /// Data dir containing one subdirectory per sample, each with a genotype .txt.
+    #[arg(short = 'i', long = "input")]
+    pub input: PathBuf,
+    /// Output PLINK prefix; writes <prefix>.bed/.bim/.fam.
+    #[arg(long)]
+    pub out_prefix: PathBuf,
+    /// Optional snp_info.tsv (full cohort SNP universe: rsid/chromosome/position).
+    #[arg(long)]
+    pub snp_info: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -505,6 +522,7 @@ fn main() -> Result<()> {
         Commands::AggregateLong(args) => run_long_aggregate(args),
         Commands::FastAlleleFreq(args) => run_fast_allele_freq(args),
         Commands::Fst(args) => run_fst(args),
+        Commands::CohortBed(args) => run_cohort_bed(args),
         Commands::MergeAlleleFreq(args) => run_merge_allele_freq(args),
         Commands::DumpLong(args) => run_long_dump(args),
         Commands::ListMissingCache(args) => run_list_missing_cache(args),
