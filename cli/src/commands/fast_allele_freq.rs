@@ -72,7 +72,11 @@ pub fn run_fast_allele_freq(args: FastAlleleFreqArgs) -> Result<()> {
 
     // Per-row TSV log can't be written safely from many threads -> single thread.
     let force_single = args.missing_ref_log.is_some();
-    let threads = if force_single { 1 } else { resolve_threads(args.threads) };
+    let threads = if force_single {
+        1
+    } else {
+        resolve_threads(args.threads)
+    };
     eprintln!(
         "▶️  fast-allele-freq: {} input file(s), threads={}",
         tasks.len(),

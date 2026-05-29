@@ -631,9 +631,7 @@ impl MissingRefLogger {
 }
 
 /// Render coalesced warning counts as `code=count, code=count` (sorted by code).
-pub(crate) fn summarize_warning_counts(
-    counts: &std::collections::BTreeMap<String, u64>,
-) -> String {
+pub(crate) fn summarize_warning_counts(counts: &std::collections::BTreeMap<String, u64>) -> String {
     counts
         .iter()
         .map(|(code, n)| format!("{code}={n}"))

@@ -88,7 +88,9 @@ fn wc84(p1: f64, n1: f64, p2: f64, n2: f64) -> Option<(f64, f64, f64)> {
     let inner = p_bar * (1.0 - p_bar) - ((r - 1.0) / r) * s2 - h_bar / 4.0;
     let a = (n_bar / nc) * (s2 - inner / (n_bar - 1.0));
     let b = (n_bar / (n_bar - 1.0))
-        * (p_bar * (1.0 - p_bar) - ((r - 1.0) / r) * s2 - (2.0 * n_bar - 1.0) * h_bar / (4.0 * n_bar));
+        * (p_bar * (1.0 - p_bar)
+            - ((r - 1.0) / r) * s2
+            - (2.0 * n_bar - 1.0) * h_bar / (4.0 * n_bar));
     let c = h_bar / 2.0;
     if a.is_finite() && b.is_finite() && c.is_finite() {
         Some((a, b, c))
