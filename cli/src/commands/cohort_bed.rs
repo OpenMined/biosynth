@@ -25,7 +25,10 @@ pub fn run_cohort_bed(args: CohortBedArgs) -> Result<()> {
     let overall = Instant::now();
     let samples = discover_samples(&args.input)?;
     if samples.is_empty() {
-        bail!("No sample subdirectories with .txt files found under {:?}", args.input);
+        bail!(
+            "No sample subdirectories with .txt files found under {:?}",
+            args.input
+        );
     }
     eprintln!("▶️  cohort-bed: {} samples", samples.len());
 
@@ -61,14 +64,16 @@ pub fn run_cohort_bed(args: CohortBedArgs) -> Result<()> {
         }
     }
     let n_snps = universe.len();
-    eprintln!("🗺️  cohort-bed: {} SNP universe x {} samples", n_snps, n_samples);
+    eprintln!(
+        "🗺️  cohort-bed: {} SNP universe x {} samples",
+        n_snps, n_samples
+    );
 
     // Optional snp_info.tsv = full cohort universe in first-seen order, matching
     // fast_pipeline.build_snp_universe's output (header rsid/chromosome/position).
     if let Some(snp_info_path) = &args.snp_info {
         let mut w = BufWriter::new(
-            File::create(snp_info_path)
-                .with_context(|| format!("Create {:?}", snp_info_path))?,
+            File::create(snp_info_path).with_context(|| format!("Create {:?}", snp_info_path))?,
         );
         writeln!(w, "rsid\tchromosome\tposition")?;
         for &id in &universe {
@@ -122,8 +127,20 @@ pub fn run_cohort_bed(args: CohortBedArgs) -> Result<()> {
         n_snps - keep.len()
     );
 
-    write_outputs(&args.out_prefix, &samples, &meta, &universe, &a1, &a2, &keep, n_samples)?;
-    eprintln!("✅ cohort-bed: done in {:.2}s", overall.elapsed().as_secs_f64());
+    write_outputs(
+        &args.out_prefix,
+        &samples,
+        &meta,
+        &universe,
+        &a1,
+        &a2,
+        &keep,
+        n_samples,
+    )?;
+    eprintln!(
+        "✅ cohort-bed: done in {:.2}s",
+        overall.elapsed().as_secs_f64()
+    );
     println!(
         "✅ Wrote {}.bed/.bim/.fam ({} variants x {} samples)",
         args.out_prefix.display(),
@@ -194,8 +211,7 @@ fn write_outputs(
         for s in 0..n_samples {
             let (x, y) = (a1[base + s], a2[base + s]);
             let called = x != 0 && y != 0;
-            let in_set =
-                (x == kv.major || x == kv.minor) && (y == kv.major || y == kv.minor);
+            let in_set = (x == kv.major || x == kv.minor) && (y == kv.major || y == kv.minor);
             // dosage = count of MINOR allele
             let two_bit = if !called || !in_set {
                 0b01 // missing

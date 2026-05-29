@@ -12,9 +12,9 @@ mod stats;
 mod util;
 
 use crate::commands::allele_report::run_allele_report;
+use crate::commands::cohort_bed::run_cohort_bed;
 use crate::commands::fast_allele_freq::run_fast_allele_freq;
 use crate::commands::fst::run_fst;
-use crate::commands::cohort_bed::run_cohort_bed;
 use crate::commands::genostats::run_genostats;
 use crate::commands::genotype_to_vcf::run_genotype_to_vcf;
 use crate::commands::list_missing_cache::run_list_missing_cache;
@@ -32,8 +32,8 @@ use crate::commands::update::run_update;
 
 mod commands {
     pub mod allele_report;
-    pub mod fast_allele_freq;
     pub mod cohort_bed;
+    pub mod fast_allele_freq;
     pub mod fst;
     pub mod genostats;
     pub mod genotype_to_vcf;
