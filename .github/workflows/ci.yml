@@ -14,6 +14,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+          components: rustfmt, clippy
+
+      - name: Show Rust versions
+        run: |
+          rustc --version
+          cargo --version
+          rustfmt --version
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('cli/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: cli/target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('cli/Cargo.lock') }}-v2
+
+      - name: Check formatting
+        run: cd cli && cargo fmt -- --check
+
+      - name: Run clippy (all targets)
+        run: cd cli && cargo clippy --all-targets --all-features --no-deps -- -D warnings
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -53,14 +95,6 @@ jobs:
         with:
           path: cli/target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('cli/Cargo.lock') }}-v2
-
-      - name: Check formatting
-        if: matrix.os != 'windows-latest'
-        run: cd cli && cargo fmt -- --check
-
-      - name: Run clippy (all targets)
-        if: matrix.os != 'windows-latest'
-        run: cd cli && cargo clippy --all-targets --all-features --no-deps -- -D warnings
 
       - name: Run tests
         run: cd cli && cargo test --verbose
