@@ -81,7 +81,10 @@ pub fn available_memory_bytes() -> Option<u64> {
     if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
         for line in meminfo.lines() {
             if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok())
+                if let Some(kb) = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
                 {
                     return Some(kb * 1024);
                 }
