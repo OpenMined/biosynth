@@ -24,6 +24,7 @@ use crate::commands::long_aggregate::run_long_aggregate;
 use crate::commands::long_dump::run_long_dump;
 use crate::commands::long_emit::run_long_emit;
 use crate::commands::merge_allele_freq::run_merge_allele_freq;
+use crate::commands::project_bed::run_project_bed;
 use crate::commands::reference_load::run_reference_load;
 use crate::commands::resolve_rsids::run_resolve_rsids;
 use crate::commands::sync_rsid_cache::run_sync_rsid_cache;
@@ -44,6 +45,7 @@ mod commands {
     pub mod long_dump;
     pub mod long_emit;
     pub mod merge_allele_freq;
+    pub mod project_bed;
     pub mod reference_load;
     pub mod resolve_rsids;
     pub mod sync_rsid_cache;
@@ -76,6 +78,8 @@ enum Commands {
     Fst(FstArgs),
     /// Build a cohort PLINK .bed/.bim/.fam from genotype files (for PCA/QC).
     CohortBed(CohortBedArgs),
+    /// Build a gnomAD-loadings-oriented PLINK bed for PCA projection.
+    ProjectBed(ProjectBedArgs),
     /// Inner-join per-population allele frequency TSVs into merged matrices.
     MergeAlleleFreq(MergeAlleleFreqArgs),
     /// Convert a .bvlr file into TSV for debugging.
@@ -290,6 +294,28 @@ pub struct CohortBedArgs {
     /// Optional snp_info.tsv (full cohort SNP universe: rsid/chromosome/position).
     #[arg(long)]
     pub snp_info: Option<PathBuf>,
+}
+
+#[derive(Args, Clone)]
+pub struct ProjectBedArgs {
+    /// Data dir containing one subdirectory per sample, each with a genotype .txt.
+    #[arg(short = 'i', long = "input")]
+    pub input: PathBuf,
+    /// gnomAD loadings variants TSV (chrom, pos, ref, alt[, locuskey]).
+    #[arg(long)]
+    pub loadings_variants: PathBuf,
+    /// Output PLINK prefix; writes <prefix>.bed/.bim/.fam.
+    #[arg(long)]
+    pub out_prefix: PathBuf,
+    /// Minimum genotype score (GS) to keep a row; missing GS counts as 1.0.
+    #[arg(long, default_value = "0.15")]
+    pub min_gs: f32,
+    /// Expected gnomAD loading sites on a healthy GSAv3 file.
+    #[arg(long, default_value = "8971")]
+    pub expected_loadings_overlap: usize,
+    /// Min fraction of expected overlap to keep a sample.
+    #[arg(long, default_value = "0.95")]
+    pub min_loadings_ratio: f64,
 }
 
 #[derive(Args, Clone)]
@@ -523,6 +549,7 @@ fn main() -> Result<()> {
         Commands::FastAlleleFreq(args) => run_fast_allele_freq(args),
         Commands::Fst(args) => run_fst(args),
         Commands::CohortBed(args) => run_cohort_bed(args),
+        Commands::ProjectBed(args) => run_project_bed(args),
         Commands::MergeAlleleFreq(args) => run_merge_allele_freq(args),
         Commands::DumpLong(args) => run_long_dump(args),
         Commands::ListMissingCache(args) => run_list_missing_cache(args),

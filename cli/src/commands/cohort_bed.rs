@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
+use dashmap::DashMap;
 use rayon::prelude::*;
 
 use crate::genotype_reader::{detect_delimiter, RowOutcome, RowParser};
@@ -38,9 +39,15 @@ pub fn run_cohort_bed(args: CohortBedArgs) -> Result<()> {
     // of holding every rsid string per sample.
     let interner = Interner::new();
     let parse_start = Instant::now();
+    // map_init gives each rayon worker a reusable per-thread cache (rsid -> global
+    // id). After a worker sees the panel once, subsequent samples resolve rsids
+    // from this local map with zero shared-map access — so the ~1e9 lookups stop
+    // contending on the DashMap shards (which all samples hit identically).
     let per_sample: Vec<Vec<(u32, u8, u8)>> = samples
         .par_iter()
-        .map(|(_sid, path)| parse_sample(path, &interner))
+        .map_init(HashMap::<String, u32>::new, |local, (_sid, path)| {
+            parse_sample(path, &interner, local)
+        })
         .collect::<Result<Vec<_>>>()?;
     eprintln!(
         "🧬 cohort-bed: parsed {} samples in {:.2}s",
@@ -225,8 +232,8 @@ fn write_outputs(
             };
             codes[s] = two_bit;
         }
-        for s in n_samples..codes.len() {
-            codes[s] = 0; // pad slots
+        for code in codes.iter_mut().skip(n_samples) {
+            *code = 0; // pad slots
         }
         for chunk in codes.chunks(4) {
             let byte = chunk[0] | (chunk[1] << 2) | (chunk[2] << 4) | (chunk[3] << 6);
@@ -261,36 +268,61 @@ fn base_label(code: u8) -> char {
 
 /// Concurrent rsid interner: rsid string -> stable id, plus id -> (rsid, chrom, pos)
 /// captured at first insertion (so .bim recovers the original strings).
+type SnpMeta = (String, String, i64);
+
+/// Sharded `DashMap` so the parallel parse doesn't serialize on one lock. The
+/// previous global `Mutex` was taken once per row (~1e9 times at 1400x692k),
+/// which collapsed parallelism (~23 min at 1400 files). Sharded locks spread the
+/// ~1e9 lookups (almost all hits — every sample shares the same rsids); only the
+/// ~1e6 distinct rsids ever insert.
 struct Interner {
-    inner: Mutex<(HashMap<String, u32>, Vec<(String, String, i64)>)>,
+    map: DashMap<String, u32>,
+    meta: DashMap<u32, SnpMeta>,
+    next: AtomicU32,
 }
 
 impl Interner {
     fn new() -> Self {
         Self {
-            inner: Mutex::new((HashMap::new(), Vec::new())),
+            map: DashMap::new(),
+            meta: DashMap::new(),
+            next: AtomicU32::new(0),
         }
     }
 
     fn intern(&self, rsid: &str, chrom: &str, pos: i64) -> u32 {
-        let mut guard = self.inner.lock().expect("interner poisoned");
-        if let Some(&id) = guard.0.get(rsid) {
-            return id;
+        // Fast path: already-seen rsid -> sharded read, no exclusive lock.
+        if let Some(id) = self.map.get(rsid) {
+            return *id;
         }
-        let id = guard.1.len() as u32;
-        guard.1.push((rsid.to_string(), chrom.to_string(), pos));
-        guard.0.insert(rsid.to_string(), id);
-        id
+        // First sighting: insert under the shard's entry lock. or_insert_with only
+        // runs (and bumps the id counter) if still vacant, so ids stay unique even
+        // if two threads race on the same new rsid.
+        *self.map.entry(rsid.to_string()).or_insert_with(|| {
+            let id = self.next.fetch_add(1, Ordering::Relaxed);
+            self.meta
+                .insert(id, (rsid.to_string(), chrom.to_string(), pos));
+            id
+        })
     }
 
-    fn into_meta(self) -> Vec<(String, String, i64)> {
-        self.inner.into_inner().expect("interner poisoned").1
+    fn into_meta(self) -> Vec<SnpMeta> {
+        let n = self.next.load(Ordering::Relaxed) as usize;
+        let mut out: Vec<SnpMeta> = vec![(String::new(), String::new(), 0); n];
+        for (id, m) in self.meta.into_iter() {
+            out[id as usize] = m;
+        }
+        out
     }
 }
 
 /// Parse one sample file: dedup rsid keep-first, return (interned_id, a1, a2).
 /// Matches `read_sample`: keep no-call rows (they define the SNP), code A/C/G/T=1..4.
-fn parse_sample(path: &Path, interner: &Interner) -> Result<Vec<(u32, u8, u8)>> {
+fn parse_sample(
+    path: &Path,
+    interner: &Interner,
+    local: &mut HashMap<String, u32>,
+) -> Result<Vec<(u32, u8, u8)>> {
     use std::io::{BufRead, BufReader};
     let file = File::open(path).with_context(|| format!("Open {:?}", path))?;
     let mut reader = BufReader::new(file);
@@ -327,7 +359,15 @@ fn parse_sample(path: &Path, interner: &Interner) -> Result<Vec<(u32, u8, u8)>> 
                 return Ok(()); // drop_duplicates keep first
             }
             let (c1, c2) = allele_codes(&gt);
-            let id = interner.intern(&rsid, &row.chrom, row.pos);
+            // Per-thread cache first; only fall to the shared interner on a miss.
+            let id = match local.get(&rsid) {
+                Some(&id) => id,
+                None => {
+                    let id = interner.intern(&rsid, &row.chrom, row.pos);
+                    local.insert(rsid.clone(), id);
+                    id
+                }
+            };
             out.push((id, c1, c2));
         }
         Ok(())
