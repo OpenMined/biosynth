@@ -7,6 +7,9 @@ use anyhow::{bail, Context, Result};
 
 use crate::FstArgs;
 
+type PopulationNames = Vec<String>;
+type MatrixRows = HashMap<String, Vec<f64>>;
+
 /// Pairwise Weir & Cockerham 1984 FST (ratio-of-averages), reproducing
 /// `04_population_level/fst_islands/scripts/02_compute_fst.py`. Reads the merged
 /// allele-frequency and allele-number matrices and writes a population x
@@ -101,7 +104,7 @@ fn wc84(p1: f64, n1: f64, p2: f64, n2: f64) -> Option<(f64, f64, f64)> {
 
 /// Read a `locus_key<TAB>pop1<TAB>...` matrix. Returns (population names, map
 /// locus_key -> per-population values). Empty / `nan` cells parse to NaN.
-fn read_matrix(path: &Path) -> Result<(Vec<String>, HashMap<String, Vec<f64>>)> {
+fn read_matrix(path: &Path) -> Result<(PopulationNames, MatrixRows)> {
     let file = File::open(path).with_context(|| format!("Open {:?}", path))?;
     let mut reader = BufReader::new(file);
     let mut header = String::new();
