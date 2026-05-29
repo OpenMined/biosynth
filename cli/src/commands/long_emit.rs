@@ -741,6 +741,11 @@ impl SharedReference {
         Ok(Self { by_rsid, by_pos })
     }
 
+    /// Number of reference rsids (proxy for output-map size when budgeting RAM).
+    pub(crate) fn reference_count(&self) -> usize {
+        self.by_rsid.len()
+    }
+
     fn resolve_rsid(&self, rsid: &str) -> Option<ReferenceVariant> {
         let rsid_norm = normalize_rsid(rsid);
         let rsid_int = rsid_norm.trim_start_matches("rs").parse::<i64>().ok()?;

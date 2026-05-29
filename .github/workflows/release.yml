@@ -220,7 +220,7 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     needs: [build]
-    if: needs.build.result == 'success'
+    if: always() && needs.build.result == 'success'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -239,7 +239,7 @@ jobs:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: [build, publish-crate, publish-docker-manifest]
-    if: needs.build.result == 'success'
+    if: always() && needs.build.result == 'success' && needs.publish-docker-manifest.result == 'success'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -294,8 +294,8 @@ jobs:
   publish-docker:
     name: Publish Docker image (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
-    needs: [build, publish-crate]
-    if: needs.build.result == 'success'
+    needs: [build]
+    if: always() && needs.build.result == 'success'
     strategy:
       matrix:
         include:
@@ -351,7 +351,7 @@ jobs:
     name: Publish Docker manifest
     runs-on: ubuntu-latest
     needs: [publish-docker]
-    if: needs.publish-docker.result == 'success'
+    if: always() && needs.publish-docker.result == 'success'
     steps:
       - uses: actions/checkout@v4
         with:

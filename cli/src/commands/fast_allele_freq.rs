@@ -72,11 +72,20 @@ pub fn run_fast_allele_freq(args: FastAlleleFreqArgs) -> Result<()> {
 
     // Per-row TSV log can't be written safely from many threads -> single thread.
     let force_single = args.missing_ref_log.is_some();
-    let threads = if force_single {
+    let requested = if force_single {
         1
     } else {
         resolve_threads(args.threads)
     };
+    // Peak RAM ~= threads x one full-panel accumulator. Cap threads so it fits the
+    // budget; each worker's map fills toward the whole panel regardless of file count.
+    let threads = cap_threads_for_ram(requested, args.max_ram_gb, shared.reference_count());
+    if threads < requested {
+        eprintln!(
+            "🧠 fast-allele-freq: capping threads {requested} -> {threads} to stay under {:.0} GB",
+            args.max_ram_gb
+        );
+    }
     eprintln!(
         "▶️  fast-allele-freq: {} input file(s), threads={}",
         tasks.len(),
@@ -90,7 +99,7 @@ pub fn run_fast_allele_freq(args: FastAlleleFreqArgs) -> Result<()> {
             .num_threads(threads)
             .build()
             .context("build fast-allele-freq thread pool")?;
-        pool.install(|| run_parallel(&tasks, &shared))?
+        pool.install(|| run_parallel(&tasks, &shared, threads))?
     };
 
     write_allele_freq(&args.allele_freq_tsv, &loci)?;
@@ -145,15 +154,22 @@ fn run_sequential(
 fn run_parallel(
     tasks: &[(u32, String, PathBuf)],
     shared: &Arc<SharedReference>,
+    threads: usize,
 ) -> Result<(LociMap, Counts)> {
-    // Each thread folds its share of files into a local map + counts, then maps
-    // are merged. Counts are order-independent; rsid uses the rank-min rule so the
-    // merge is deterministic and matches the single-threaded result.
-    let result = tasks
-        .par_iter()
-        .fold(
-            || ThreadState::new(shared.clone()),
-            |mut st, (rank, participant, path)| {
+    // Split into exactly `threads` contiguous chunks so there are exactly `threads`
+    // accumulators (one full-panel map each). Using par_iter().fold() instead lets
+    // rayon create many more accumulators than threads, so peak RAM grew with file
+    // count (e.g. 32 GB at 1400 files). Chunking pins peak RAM to threads x panel.
+    // Each chunk folds its files into a local map + counts; maps are merged. Counts
+    // are order-independent; rsid uses the rank-min rule so the merge is
+    // deterministic and matches the single-threaded result.
+    let chunk_size = tasks.len().div_ceil(threads.max(1)).max(1);
+    let chunks: Vec<&[(u32, String, PathBuf)]> = tasks.chunks(chunk_size).collect();
+    let result = chunks
+        .into_par_iter()
+        .map(|chunk| {
+            let mut st = ThreadState::new(shared.clone());
+            for (rank, participant, path) in chunk {
                 match collect_merged_long_rows(path, participant, &mut st.resolver, &mut st.logger)
                 {
                     Ok((rows, _stats)) => {
@@ -163,10 +179,9 @@ fn run_parallel(
                     }
                     Err(err) => eprintln!("⚠️  skipping {}: {err:#}", path.display()),
                 }
-                st
-            },
-        )
-        .map(|st| (st.loci, st.logger.counts().clone()))
+            }
+            (st.loci, st.logger.counts().clone())
+        })
         .reduce(
             || (BTreeMap::new(), BTreeMap::new()),
             |(mut m1, mut c1), (m2, c2)| {
@@ -176,6 +191,28 @@ fn run_parallel(
             },
         );
     Ok(result)
+}
+
+/// Cap worker threads so peak RAM (~threads x one full-panel accumulator) fits the
+/// budget. Estimate per-thread bytes from the reference rsid count (output loci are
+/// ~1.5x that; ~1600 B/rsid covers the map entry + transient row buffers).
+///
+/// `max_ram_gb <= 0` => auto: 80% of detected available RAM (honors container cgroup
+/// limits). If RAM can't be detected, fall back to the requested thread count.
+fn cap_threads_for_ram(requested: usize, max_ram_gb: f64, ref_count: usize) -> usize {
+    let budget = if max_ram_gb > 0.0 {
+        max_ram_gb * 1e9
+    } else {
+        match crate::util::available_memory_bytes() {
+            Some(bytes) => bytes as f64 * 0.8,
+            None => return requested.max(1),
+        }
+    };
+    let per_thread = (ref_count as f64 * 1600.0).max(1.0);
+    // Keep ~0.5 GB headroom for the final merged map + I/O buffers.
+    let usable = (budget - 0.5e9).max(per_thread);
+    let cap = (usable / per_thread).floor() as usize;
+    requested.min(cap.max(1)).max(1)
 }
 
 struct ThreadState {
