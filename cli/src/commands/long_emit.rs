@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -14,7 +15,7 @@ use crate::long_rows::{
 };
 use crate::rsid_cache::normalize_rsid;
 use crate::stats::{ReferenceVariant, StatsStore};
-use crate::EmitLongArgs;
+use crate::{EmitLongArgs, WarnDetail};
 use rusqlite::OptionalExtension;
 
 const LOOKAHEAD_LINES: usize = 2048;
@@ -65,7 +66,8 @@ pub fn run_long_emit(args: EmitLongArgs) -> Result<()> {
             .participant
             .clone()
             .unwrap_or_else(|| default_participant(input));
-        let mut missing_logger = MissingRefLogger::new(args.missing_ref_log.as_deref())?;
+        let mut missing_logger =
+            MissingRefLogger::new(args.missing_ref_log.as_deref(), args.warn_detail)?;
         let stats = match emit_from_genotype(
             input,
             &output_path,
@@ -89,6 +91,12 @@ pub fn run_long_emit(args: EmitLongArgs) -> Result<()> {
             "✅ emit-long (genotype): {} parsed, {} rows, {} missing-ref, {} missing-gt",
             stats.rows_parsed, stats.rows_emitted, stats.missing_reference, stats.missing_gt
         );
+        if args.warn_detail == WarnDetail::Summary {
+            let summary = summarize_warning_counts(missing_logger.counts());
+            if !summary.is_empty() {
+                eprintln!("⚠️  emit-long warnings [{}]: {}", input.display(), summary);
+            }
+        }
         eprintln!(
             "⏱️  emit-long: {} took {:.2}s",
             input.display(),
@@ -110,12 +118,12 @@ pub fn run_long_emit(args: EmitLongArgs) -> Result<()> {
     Ok(())
 }
 
-struct EmitStats {
+pub(crate) struct EmitStats {
     variants_seen: u64,
     rows_emitted: u64,
     missing_gt: u64,
-    rows_parsed: u64,
-    missing_reference: u64,
+    pub(crate) rows_parsed: u64,
+    pub(crate) missing_reference: u64,
 }
 
 fn emit_from_vcf(
@@ -223,6 +231,25 @@ fn emit_from_genotype(
     resolver: &mut ReferenceResolver,
     missing_logger: &mut MissingRefLogger,
 ) -> Result<EmitStats> {
+    let (pending_rows, mut stats) =
+        parse_genotype_file_to_pending(input, participant, resolver, missing_logger)?;
+    let mut writer = LongRowWriter::new(BufWriter::new(
+        File::create(output).with_context(|| format!("Create {:?}", output))?,
+    ));
+    write_merged_long_rows(&mut writer, pending_rows, &mut stats)?;
+    writer.flush()?;
+    Ok(stats)
+}
+
+/// Parse a genotype file into per-(locus,rsid,participant) pending rows, reusing
+/// the exact emit-long parse/resolve/dosage path. Shared by the on-disk `.bvlr`
+/// emitter and the in-memory fused aggregator.
+fn parse_genotype_file_to_pending(
+    input: &Path,
+    participant: &str,
+    resolver: &mut ReferenceResolver,
+    missing_logger: &mut MissingRefLogger,
+) -> Result<(Vec<PendingLongRow>, EmitStats)> {
     let input_file = File::open(input).with_context(|| format!("Open {:?}", input))?;
     let mut reader = BufReader::new(input_file);
     let mut buffered_lines: Vec<String> = Vec::new();
@@ -279,12 +306,22 @@ fn emit_from_genotype(
         consume_genotype_line(&mut ctx, &buffer, line_number)?;
     }
 
-    let mut writer = LongRowWriter::new(BufWriter::new(
-        File::create(output).with_context(|| format!("Create {:?}", output))?,
-    ));
-    write_merged_long_rows(&mut writer, pending_rows, &mut stats)?;
-    writer.flush()?;
-    Ok(stats)
+    Ok((pending_rows, stats))
+}
+
+/// Parse a genotype file and return the same merged `LongRow`s that would be
+/// written to a `.bvlr`, but in memory. Lets callers aggregate without the
+/// intermediate file. Output is identical to the rows in the `.bvlr`.
+pub(crate) fn collect_merged_long_rows(
+    input: &Path,
+    participant: &str,
+    resolver: &mut ReferenceResolver,
+    missing_logger: &mut MissingRefLogger,
+) -> Result<(Vec<LongRow>, EmitStats)> {
+    let (pending_rows, mut stats) =
+        parse_genotype_file_to_pending(input, participant, resolver, missing_logger)?;
+    let rows = merge_pending_rows(pending_rows, &mut stats);
+    Ok((rows, stats))
 }
 
 struct GenotypeEmitContext<'a> {
@@ -311,13 +348,14 @@ fn consume_genotype_line(
     let outcome = match ctx.parser.consume_line(line) {
         Ok(outcome) => outcome,
         Err(err) => {
-            ctx.missing_logger
-                .log_issue(ctx.input, line_number, "parse_error", "", line)?;
-            eprintln!(
-                "WARNING: {}:{}: parse_error: {err:#}",
-                ctx.input.display(),
-                line_number
-            );
+            ctx.missing_logger.log_issue_detail(
+                ctx.input,
+                line_number,
+                "parse_error",
+                "",
+                line,
+                Some(&format!("{err:#}")),
+            )?;
             return Ok(());
         }
     };
@@ -332,19 +370,14 @@ fn consume_genotype_line(
                 match ctx.resolver.resolve_rsid(&rsid_label) {
                     Ok(reference) => reference,
                     Err(err) => {
-                        ctx.missing_logger.log_issue(
+                        ctx.missing_logger.log_issue_detail(
                             ctx.input,
                             line_number,
                             "rsid_resolve_error",
                             &rsid_label,
                             line,
+                            Some(&format!("{err:#}")),
                         )?;
-                        eprintln!(
-                            "WARNING: {}:{}: rsid_resolve_error {}: {err:#}",
-                            ctx.input.display(),
-                            line_number,
-                            rsid_label
-                        );
                         None
                     }
                 }
@@ -359,20 +392,14 @@ fn consume_genotype_line(
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        ctx.missing_logger.log_issue(
+                        ctx.missing_logger.log_issue_detail(
                             ctx.input,
                             line_number,
                             "position_resolve_error",
                             &format!("{}:{}", row.chrom, row.pos),
                             line,
+                            Some(&format!("{err:#}")),
                         )?;
-                        eprintln!(
-                            "WARNING: {}:{}: position_resolve_error {}:{}: {err:#}",
-                            ctx.input.display(),
-                            line_number,
-                            row.chrom,
-                            row.pos
-                        );
                     }
                 }
             }
@@ -457,6 +484,16 @@ fn write_merged_long_rows(
     pending_rows: Vec<PendingLongRow>,
     stats: &mut EmitStats,
 ) -> Result<()> {
+    for row in merge_pending_rows(pending_rows, stats) {
+        writer.write_row(&row)?;
+    }
+    Ok(())
+}
+
+/// Collapse pending rows by (locus_key, rsid, participant), preserving first-seen
+/// order, applying duplicate-probe selection. Increments `rows_emitted` per merged
+/// row so on-disk and in-memory paths report identical stats.
+fn merge_pending_rows(pending_rows: Vec<PendingLongRow>, stats: &mut EmitStats) -> Vec<LongRow> {
     let mut order: Vec<String> = Vec::new();
     let mut groups: HashMap<String, Vec<LongRow>> = HashMap::new();
     for pending in pending_rows {
@@ -466,13 +503,13 @@ fn write_merged_long_rows(
         groups.entry(pending.key).or_default().push(pending.row);
     }
 
+    let mut out = Vec::with_capacity(order.len());
     for key in order {
         let members = groups.remove(&key).expect("group present");
-        let selected = select_duplicate_probe_row(&members);
-        writer.write_row(&selected)?;
+        out.push(select_duplicate_probe_row(&members));
         stats.rows_emitted += 1;
     }
-    Ok(())
+    out
 }
 
 fn select_duplicate_probe_row(rows: &[LongRow]) -> LongRow {
@@ -497,12 +534,14 @@ fn clean_rsid_label(value: &str) -> String {
     normalize_rsid(value)
 }
 
-struct MissingRefLogger {
+pub(crate) struct MissingRefLogger {
     writer: Option<BufWriter<File>>,
+    detail: WarnDetail,
+    counts: std::collections::BTreeMap<String, u64>,
 }
 
 impl MissingRefLogger {
-    fn new(path: Option<&Path>) -> Result<Self> {
+    pub(crate) fn new(path: Option<&Path>, detail: WarnDetail) -> Result<Self> {
         let writer = if let Some(path) = path {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
@@ -519,7 +558,16 @@ impl MissingRefLogger {
         } else {
             None
         };
-        Ok(Self { writer })
+        Ok(Self {
+            writer,
+            detail,
+            counts: std::collections::BTreeMap::new(),
+        })
+    }
+
+    /// Coalesced warning counts keyed by code (for end-of-file/run summaries).
+    pub(crate) fn counts(&self) -> &std::collections::BTreeMap<String, u64> {
+        &self.counts
     }
 
     fn log_issue(
@@ -529,6 +577,22 @@ impl MissingRefLogger {
         code: &str,
         label: &str,
         raw_line: &str,
+    ) -> Result<()> {
+        self.log_issue_detail(input, line_number, code, label, raw_line, None)
+    }
+
+    /// Record a tolerated row-level issue. The full per-row TSV (when
+    /// `--missing-ref-log` is set) is unchanged; human-facing stderr is now
+    /// coalesced: only `WarnDetail::Full` prints per row. Counts are always kept
+    /// so callers can print a one-line summary per file/run.
+    fn log_issue_detail(
+        &mut self,
+        input: &Path,
+        line_number: u64,
+        code: &str,
+        label: &str,
+        raw_line: &str,
+        detail_msg: Option<&str>,
     ) -> Result<()> {
         let trimmed = raw_line.trim_end();
         if let Some(writer) = self.writer.as_mut() {
@@ -541,20 +605,38 @@ impl MissingRefLogger {
                 code,
                 trimmed
             )?;
-        } else if !matches!(
-            code,
-            "parse_error" | "rsid_resolve_error" | "position_resolve_error"
-        ) {
-            eprintln!(
-                "WARNING: {}:{}: {} {}",
-                input.display(),
-                line_number,
-                code,
-                label
-            );
+        }
+        *self.counts.entry(code.to_string()).or_insert(0) += 1;
+        if self.detail == WarnDetail::Full {
+            match detail_msg {
+                Some(msg) => eprintln!(
+                    "WARNING: {}:{}: {} {} {}",
+                    input.display(),
+                    line_number,
+                    code,
+                    label,
+                    msg
+                ),
+                None => eprintln!(
+                    "WARNING: {}:{}: {} {}",
+                    input.display(),
+                    line_number,
+                    code,
+                    label
+                ),
+            }
         }
         Ok(())
     }
+}
+
+/// Render coalesced warning counts as `code=count, code=count` (sorted by code).
+pub(crate) fn summarize_warning_counts(counts: &std::collections::BTreeMap<String, u64>) -> String {
+    counts
+        .iter()
+        .map(|(code, n)| format!("{code}={n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn resolve_output_path(input: &Path, output: Option<&PathBuf>) -> Result<PathBuf> {
@@ -574,7 +656,7 @@ fn resolve_output_path(input: &Path, output: Option<&PathBuf>) -> Result<PathBuf
     Ok(out)
 }
 
-fn default_participant(input: &Path) -> String {
+pub(crate) fn default_participant(input: &Path) -> String {
     input
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -587,14 +669,103 @@ fn is_gz(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("gz")
 }
 
-struct ReferenceResolver {
+/// Reference resolver with two backends that return identical results:
+/// - `Sqlite`: per-connection, lazily cached. Used by `emit-long` (one file at a
+///   time) where a single connection is fine.
+/// - `Shared`: the whole reference preloaded into in-memory maps, shared via
+///   `Arc` across threads. Lock-free reads, so parallel parsing actually scales
+///   (the SQLite backend serializes/contends under many threads).
+pub(crate) enum ReferenceResolver {
+    Sqlite(SqliteResolver),
+    Shared(Arc<SharedReference>),
+}
+
+impl ReferenceResolver {
+    pub(crate) fn new(store: &StatsStore) -> Result<Self> {
+        Ok(ReferenceResolver::Sqlite(SqliteResolver::new(store)?))
+    }
+
+    pub(crate) fn shared(reference: Arc<SharedReference>) -> Self {
+        ReferenceResolver::Shared(reference)
+    }
+
+    fn resolve_rsid(&mut self, rsid: &str) -> Result<Option<ReferenceVariant>> {
+        match self {
+            ReferenceResolver::Sqlite(r) => r.resolve_rsid(rsid),
+            ReferenceResolver::Shared(r) => Ok(r.resolve_rsid(rsid)),
+        }
+    }
+
+    fn resolve_position(&mut self, chrom: &str, pos: i64) -> Result<Option<ReferenceVariant>> {
+        match self {
+            ReferenceResolver::Sqlite(r) => r.resolve_position(chrom, pos),
+            ReferenceResolver::Shared(r) => Ok(r.resolve_position(chrom, pos)),
+        }
+    }
+}
+
+/// Reference preloaded into memory once, then shared read-only across threads.
+/// Built from the same tables the SQLite resolver queries, with the same
+/// precedence (user overrides win) and the same position-ambiguity rule.
+pub(crate) struct SharedReference {
+    by_rsid: HashMap<i64, ReferenceVariant>,
+    by_pos: HashMap<(String, i64), Option<ReferenceVariant>>,
+}
+
+impl SharedReference {
+    pub(crate) fn load(store: &StatsStore) -> Result<Self> {
+        let mut by_rsid: HashMap<i64, ReferenceVariant> = HashMap::new();
+        // all_references_with_overrides() = user rows UNION base rows not in user,
+        // matching SqliteResolver's user-then-base lookup order.
+        for variant in store.all_references_with_overrides()? {
+            by_rsid.insert(variant.rsid, variant);
+        }
+        let mut by_pos: HashMap<(String, i64), Option<ReferenceVariant>> = HashMap::new();
+        for variant in store.all_non_rsids()? {
+            let key = (normalize_chrom(&variant.chromosome), variant.position);
+            match by_pos.get(&key) {
+                Some(None) => {} // already ambiguous
+                Some(Some(existing)) => {
+                    if existing.rsid != variant.rsid
+                        || existing.reference != variant.reference
+                        || existing.alternates != variant.alternates
+                    {
+                        by_pos.insert(key, None);
+                    }
+                }
+                None => {
+                    by_pos.insert(key, Some(variant));
+                }
+            }
+        }
+        Ok(Self { by_rsid, by_pos })
+    }
+
+    fn resolve_rsid(&self, rsid: &str) -> Option<ReferenceVariant> {
+        let rsid_norm = normalize_rsid(rsid);
+        let rsid_int = rsid_norm.trim_start_matches("rs").parse::<i64>().ok()?;
+        self.by_rsid.get(&rsid_int).cloned()
+    }
+
+    fn resolve_position(&self, chrom: &str, pos: i64) -> Option<ReferenceVariant> {
+        if pos <= 0 {
+            return None;
+        }
+        self.by_pos
+            .get(&(normalize_chrom(chrom), pos))
+            .cloned()
+            .flatten()
+    }
+}
+
+pub(crate) struct SqliteResolver {
     conn: rusqlite::Connection,
     rsid_cache: HashMap<i64, Option<ReferenceVariant>>,
     position_cache: HashMap<(String, i64), Option<ReferenceVariant>>,
 }
 
-impl ReferenceResolver {
-    fn new(store: &StatsStore) -> Result<Self> {
+impl SqliteResolver {
+    pub(crate) fn new(store: &StatsStore) -> Result<Self> {
         let conn = store.open_connection()?;
         Ok(Self {
             conn,
@@ -761,30 +932,32 @@ mod tests {
                 ('AMBIG_2', 125, '3', 300, 'A', 'T', 'test');",
         )
         .unwrap();
-        ReferenceResolver {
+        ReferenceResolver::Sqlite(SqliteResolver {
             conn,
             rsid_cache: HashMap::new(),
             position_cache: HashMap::new(),
-        }
+        })
     }
 
     fn full_test_resolver() -> ReferenceResolver {
         let resolver = test_resolver();
-        resolver
-            .conn
-            .execute_batch(
-                "INSERT INTO rsid_reference
-                    (rsid, chromosome, position, reference, alternates)
-                VALUES
-                    (1, '1', 100, 'A', 'G'),
-                    (2, '1', 200, 'C', 'T'),
-                    (3, '2', 300, 'A', 'C');
-                INSERT INTO grch38_non_rsids
-                    (snp_name, rsid, chromosome, position, reference, alternates, source)
-                VALUES
-                    ('NONRS_CNV_A', 3, '2', 300, 'A', 'C', 'test');",
-            )
-            .unwrap();
+        if let ReferenceResolver::Sqlite(inner) = &resolver {
+            inner
+                .conn
+                .execute_batch(
+                    "INSERT INTO rsid_reference
+                        (rsid, chromosome, position, reference, alternates)
+                    VALUES
+                        (1, '1', 100, 'A', 'G'),
+                        (2, '1', 200, 'C', 'T'),
+                        (3, '2', 300, 'A', 'C');
+                    INSERT INTO grch38_non_rsids
+                        (snp_name, rsid, chromosome, position, reference, alternates, source)
+                    VALUES
+                        ('NONRS_CNV_A', 3, '2', 300, 'A', 'C', 'test');",
+                )
+                .unwrap();
+        }
         resolver
     }
 
@@ -809,7 +982,7 @@ mod tests {
         participant: &str,
         warning_log: &Path,
     ) {
-        let mut logger = MissingRefLogger::new(Some(warning_log)).unwrap();
+        let mut logger = MissingRefLogger::new(Some(warning_log), WarnDetail::Full).unwrap();
         let stats = emit_from_genotype(input, output, participant, resolver, &mut logger).unwrap();
         assert!(
             stats.rows_emitted > 0,

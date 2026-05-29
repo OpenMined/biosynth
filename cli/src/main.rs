@@ -12,6 +12,8 @@ mod stats;
 mod util;
 
 use crate::commands::allele_report::run_allele_report;
+use crate::commands::fast_allele_freq::run_fast_allele_freq;
+use crate::commands::fst::run_fst;
 use crate::commands::genostats::run_genostats;
 use crate::commands::genotype_to_vcf::run_genotype_to_vcf;
 use crate::commands::list_missing_cache::run_list_missing_cache;
@@ -20,6 +22,7 @@ use crate::commands::load_non_rsids::run_load_non_rsids;
 use crate::commands::long_aggregate::run_long_aggregate;
 use crate::commands::long_dump::run_long_dump;
 use crate::commands::long_emit::run_long_emit;
+use crate::commands::merge_allele_freq::run_merge_allele_freq;
 use crate::commands::reference_load::run_reference_load;
 use crate::commands::resolve_rsids::run_resolve_rsids;
 use crate::commands::sync_rsid_cache::run_sync_rsid_cache;
@@ -28,6 +31,8 @@ use crate::commands::update::run_update;
 
 mod commands {
     pub mod allele_report;
+    pub mod fast_allele_freq;
+    pub mod fst;
     pub mod genostats;
     pub mod genotype_to_vcf;
     pub mod list_missing_cache;
@@ -36,6 +41,7 @@ mod commands {
     pub mod long_aggregate;
     pub mod long_dump;
     pub mod long_emit;
+    pub mod merge_allele_freq;
     pub mod reference_load;
     pub mod resolve_rsids;
     pub mod sync_rsid_cache;
@@ -62,6 +68,12 @@ enum Commands {
     EmitLong(EmitLongArgs),
     /// Aggregate long-row records into matrix and allele frequency TSVs.
     AggregateLong(AggregateLongArgs),
+    /// Fused parse+aggregate: genotype files -> allele frequency TSV, no .bvlr.
+    FastAlleleFreq(FastAlleleFreqArgs),
+    /// Pairwise Weir & Cockerham 1984 FST matrix from merged allele freq/number.
+    Fst(FstArgs),
+    /// Inner-join per-population allele frequency TSVs into merged matrices.
+    MergeAlleleFreq(MergeAlleleFreqArgs),
     /// Convert a .bvlr file into TSV for debugging.
     DumpLong(DumpLongArgs),
     /// List rsids missing from the database based on a cache file.
@@ -197,6 +209,9 @@ pub struct EmitLongArgs {
     /// Optional log file for missing reference rows (appends).
     #[arg(long)]
     pub missing_ref_log: Option<PathBuf>,
+    /// Warning verbosity: none, summary (default), or full (per-row).
+    #[arg(long, value_enum, default_value_t = WarnDetail::Summary)]
+    pub warn_detail: WarnDetail,
 }
 
 #[derive(Args, Clone)]
@@ -228,6 +243,60 @@ pub struct AggregateLongArgs {
     /// Number of worker threads to use (0 = auto/all cores).
     #[arg(long, default_value = "0")]
     pub threads: usize,
+}
+
+#[derive(Args, Clone)]
+pub struct FastAlleleFreqArgs {
+    /// Input genotype file(s) or directories (scanned recursively).
+    #[arg(short = 'i', long = "input")]
+    pub inputs: Vec<PathBuf>,
+    /// Path to the SQLite database containing rsid_reference data.
+    #[arg(long, default_value = "data/genostats.sqlite")]
+    pub sqlite: PathBuf,
+    /// Force re-download of the reference database.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub force_download: bool,
+    /// Output allele frequency TSV path.
+    #[arg(long)]
+    pub allele_freq_tsv: PathBuf,
+    /// Optional log file for missing reference rows (per-row TSV; forces single thread).
+    #[arg(long)]
+    pub missing_ref_log: Option<PathBuf>,
+    /// Warning verbosity: none, summary (default), or full (per-row).
+    #[arg(long, value_enum, default_value_t = WarnDetail::Summary)]
+    pub warn_detail: WarnDetail,
+    /// Worker threads for parsing (0 = auto/all cores).
+    #[arg(long, default_value = "0")]
+    pub threads: usize,
+}
+
+#[derive(Args, Clone)]
+pub struct FstArgs {
+    /// Merged allele-frequency matrix TSV (locus_key + one column per population).
+    #[arg(long)]
+    pub merged_freq: PathBuf,
+    /// Merged allele-number matrix TSV (same shape as --merged-freq).
+    #[arg(long)]
+    pub merged_number: PathBuf,
+    /// Output population x population FST matrix TSV.
+    #[arg(long)]
+    pub output: PathBuf,
+}
+
+#[derive(Args, Clone)]
+pub struct MergeAlleleFreqArgs {
+    /// Population inputs as LABEL=PATH (repeatable; column order preserved).
+    #[arg(long = "population")]
+    pub populations: Vec<String>,
+    /// Output merged allele-frequency matrix TSV.
+    #[arg(long)]
+    pub merged_freq: PathBuf,
+    /// Output merged allele-number matrix TSV.
+    #[arg(long)]
+    pub merged_number: PathBuf,
+    /// Optional rsid-annotated merged frequency matrix TSV.
+    #[arg(long)]
+    pub merged_annotated: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -311,6 +380,16 @@ pub struct SyncRsidCacheArgs {
     /// Apply changes to SQLite (default: dry run).
     #[arg(long, action = ArgAction::SetTrue)]
     pub apply: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarnDetail {
+    /// Suppress per-row warnings entirely.
+    None,
+    /// Print one coalesced count-per-code summary per file/run (default).
+    Summary,
+    /// Print every warning row (verbose; for debugging).
+    Full,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -419,6 +498,9 @@ fn main() -> Result<()> {
         Commands::GenotypeToVcf(args) => run_genotype_to_vcf(args),
         Commands::EmitLong(args) => run_long_emit(args),
         Commands::AggregateLong(args) => run_long_aggregate(args),
+        Commands::FastAlleleFreq(args) => run_fast_allele_freq(args),
+        Commands::Fst(args) => run_fst(args),
+        Commands::MergeAlleleFreq(args) => run_merge_allele_freq(args),
         Commands::DumpLong(args) => run_long_dump(args),
         Commands::ListMissingCache(args) => run_list_missing_cache(args),
         Commands::ListMissingRsids(args) => run_list_missing_rsids(args),
