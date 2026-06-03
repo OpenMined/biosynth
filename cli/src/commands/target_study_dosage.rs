@@ -38,6 +38,16 @@ struct SampleResult {
     counts: std::collections::BTreeMap<String, u64>,
 }
 
+struct OutputState<'a> {
+    n_variants: usize,
+    matrix: &'a mut [u8],
+    allele_count: &'a mut [i64],
+    n_obs: &'a mut [i64],
+    num_homo: &'a mut [i64],
+    num_hetero: &'a mut [i64],
+    warning_counts: &'a mut std::collections::BTreeMap<String, u64>,
+}
+
 pub fn run_target_study_dosage(args: TargetStudyDosageArgs) -> Result<()> {
     let overall_start = Instant::now();
 
@@ -120,16 +130,16 @@ pub fn run_target_study_dosage(args: TargetStudyDosageArgs) -> Result<()> {
                         // The sequential logger is cumulative and may also write
                         // per-row details, so merge its counts once after the loop.
                         result.counts.clear();
-                        apply_sample_result(
-                            result,
+                        let mut output = OutputState {
                             n_variants,
-                            &mut matrix,
-                            &mut allele_count,
-                            &mut n_obs,
-                            &mut num_homo,
-                            &mut num_hetero,
-                            &mut warning_counts,
-                        )
+                            matrix: &mut matrix,
+                            allele_count: &mut allele_count,
+                            n_obs: &mut n_obs,
+                            num_homo: &mut num_homo,
+                            num_hetero: &mut num_hetero,
+                            warning_counts: &mut warning_counts,
+                        };
+                        apply_sample_result(result, &mut output)
                     }
                     Err(err) => eprintln!("⚠️  skipping {}: {err:#}", path.display()),
                 }
@@ -167,16 +177,18 @@ pub fn run_target_study_dosage(args: TargetStudyDosageArgs) -> Result<()> {
             });
             for (task, result) in batch.iter().zip(results) {
                 match result {
-                    Ok(result) => apply_sample_result(
-                        result,
-                        n_variants,
-                        &mut matrix,
-                        &mut allele_count,
-                        &mut n_obs,
-                        &mut num_homo,
-                        &mut num_hetero,
-                        &mut warning_counts,
-                    ),
+                    Ok(result) => {
+                        let mut output = OutputState {
+                            n_variants,
+                            matrix: &mut matrix,
+                            allele_count: &mut allele_count,
+                            n_obs: &mut n_obs,
+                            num_homo: &mut num_homo,
+                            num_hetero: &mut num_hetero,
+                            warning_counts: &mut warning_counts,
+                        };
+                        apply_sample_result(result, &mut output)
+                    }
                     Err(err) => eprintln!("⚠️  skipping {}: {err:#}", task.2.display()),
                 }
             }
@@ -268,30 +280,21 @@ fn locus_base_key(locus_key: &str) -> Option<String> {
     Some(base.to_string())
 }
 
-fn apply_sample_result(
-    result: SampleResult,
-    n_variants: usize,
-    matrix: &mut [u8],
-    allele_count: &mut [i64],
-    n_obs: &mut [i64],
-    num_homo: &mut [i64],
-    num_hetero: &mut [i64],
-    warning_counts: &mut std::collections::BTreeMap<String, u64>,
-) {
-    merge_counts(warning_counts, result.counts);
-    let row_offset = result.row_idx * n_variants;
+fn apply_sample_result(result: SampleResult, output: &mut OutputState<'_>) {
+    merge_counts(output.warning_counts, result.counts);
+    let row_offset = result.row_idx * output.n_variants;
     for (col, dosage) in result.hits {
-        let cell = &mut matrix[row_offset + col];
+        let cell = &mut output.matrix[row_offset + col];
         if *cell != MISSING {
             continue;
         }
         *cell = dosage;
-        allele_count[col] += dosage as i64;
-        n_obs[col] += 1;
+        output.allele_count[col] += dosage as i64;
+        output.n_obs[col] += 1;
         if dosage == 2 {
-            num_homo[col] += 1;
+            output.num_homo[col] += 1;
         } else if dosage == 1 {
-            num_hetero[col] += 1;
+            output.num_hetero[col] += 1;
         }
     }
 }
