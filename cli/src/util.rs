@@ -37,6 +37,24 @@ pub fn collect_input_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+pub fn genotype_file_stem(path: &Path) -> Option<String> {
+    let mut name = path.file_name()?.to_str()?.to_string();
+    if name.to_ascii_lowercase().ends_with(".gz") {
+        name.truncate(name.len() - 3);
+    }
+    for ext in [".txt", ".tsv", ".csv"] {
+        if name.to_ascii_lowercase().ends_with(ext) {
+            name.truncate(name.len() - ext.len());
+            break;
+        }
+    }
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 fn canonicalize_path<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
     let path_ref = path.as_ref();
     match fs::canonicalize(path_ref) {
@@ -47,7 +65,16 @@ fn canonicalize_path<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
 
 fn is_candidate_file(path: &Path) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        let ext_lower = ext.to_lowercase();
+        let ext_lower = ext.to_ascii_lowercase();
+        if ext_lower == "gz" {
+            return path
+                .file_stem()
+                .and_then(|stem| Path::new(stem).extension())
+                .and_then(|e| e.to_str())
+                .is_some_and(|inner| {
+                    matches!(inner.to_ascii_lowercase().as_str(), "txt" | "tsv" | "csv")
+                });
+        }
         return matches!(ext_lower.as_str(), "txt" | "tsv" | "csv");
     }
     true

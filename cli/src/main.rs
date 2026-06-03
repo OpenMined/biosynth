@@ -17,6 +17,7 @@ use crate::commands::fast_allele_freq::run_fast_allele_freq;
 use crate::commands::fst::run_fst;
 use crate::commands::genostats::run_genostats;
 use crate::commands::genotype_to_vcf::run_genotype_to_vcf;
+use crate::commands::het_signal::run_het_signal;
 use crate::commands::list_missing_cache::run_list_missing_cache;
 use crate::commands::list_missing_rsids::run_list_missing_rsids;
 use crate::commands::load_non_rsids::run_load_non_rsids;
@@ -29,6 +30,7 @@ use crate::commands::reference_load::run_reference_load;
 use crate::commands::resolve_rsids::run_resolve_rsids;
 use crate::commands::sync_rsid_cache::run_sync_rsid_cache;
 use crate::commands::synthetic::run_synthetic;
+use crate::commands::target_study_dosage::run_target_study_dosage;
 use crate::commands::update::run_update;
 
 mod commands {
@@ -38,6 +40,7 @@ mod commands {
     pub mod fst;
     pub mod genostats;
     pub mod genotype_to_vcf;
+    pub mod het_signal;
     pub mod list_missing_cache;
     pub mod list_missing_rsids;
     pub mod load_non_rsids;
@@ -50,6 +53,7 @@ mod commands {
     pub mod resolve_rsids;
     pub mod sync_rsid_cache;
     pub mod synthetic;
+    pub mod target_study_dosage;
     pub mod update;
 }
 
@@ -74,12 +78,17 @@ enum Commands {
     AggregateLong(AggregateLongArgs),
     /// Fused parse+aggregate: genotype files -> allele frequency TSV, no .bvlr.
     FastAlleleFreq(FastAlleleFreqArgs),
+    /// Build a target-panel-aligned study dosage matrix and allele frequency TSV.
+    #[command(visible_alias = "hgp1k-study-dosage")]
+    TargetStudyDosage(TargetStudyDosageArgs),
     /// Pairwise Weir & Cockerham 1984 FST matrix from merged allele freq/number.
     Fst(FstArgs),
     /// Build a cohort PLINK .bed/.bim/.fam from genotype files (for PCA/QC).
     CohortBed(CohortBedArgs),
     /// Build a gnomAD-loadings-oriented PLINK bed for PCA projection.
     ProjectBed(ProjectBedArgs),
+    /// Per-sample het-signal caches for sex-biased admixture NMF.
+    HetSignal(HetSignalArgs),
     /// Inner-join per-population allele frequency TSVs into merged matrices.
     MergeAlleleFreq(MergeAlleleFreqArgs),
     /// Convert a .bvlr file into TSV for debugging.
@@ -284,6 +293,46 @@ pub struct FastAlleleFreqArgs {
 }
 
 #[derive(Args, Clone)]
+pub struct TargetStudyDosageArgs {
+    /// Input genotype file(s) or directories (scanned recursively).
+    #[arg(short = 'i', long = "input")]
+    pub inputs: Vec<PathBuf>,
+    /// Target variants TSV with chrom, pos, rsid, ref, alt columns.
+    #[arg(long)]
+    pub variants_tsv: PathBuf,
+    /// Path to the SQLite database containing rsid_reference data.
+    #[arg(long, default_value = "data/genostats.sqlite")]
+    pub sqlite: PathBuf,
+    /// Force re-download of the reference database.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub force_download: bool,
+    /// Output uint8 NumPy .npy matrix path. Shape is samples x variants.
+    #[arg(long)]
+    pub dosage_npy: PathBuf,
+    /// Output sample metadata TSV path.
+    #[arg(long)]
+    pub samples_tsv: PathBuf,
+    /// Output variant metadata TSV path, aligned to matrix columns.
+    #[arg(long)]
+    pub study_variants_tsv: PathBuf,
+    /// Output allele frequency TSV path.
+    #[arg(long)]
+    pub allele_freq_tsv: PathBuf,
+    /// Optional log file for missing reference rows (per-row TSV; forces single thread).
+    #[arg(long)]
+    pub missing_ref_log: Option<PathBuf>,
+    /// Warning verbosity: none, summary (default), or full (per-row).
+    #[arg(long, value_enum, default_value_t = WarnDetail::Summary)]
+    pub warn_detail: WarnDetail,
+    /// Worker threads for parsing (0 = auto/all cores).
+    #[arg(long, default_value = "0")]
+    pub threads: usize,
+    /// Number of samples to parse in each parallel batch. 0 = threads.
+    #[arg(long, default_value = "0")]
+    pub batch_samples: usize,
+}
+
+#[derive(Args, Clone)]
 pub struct CohortBedArgs {
     /// Data dir containing one subdirectory per sample, each with a genotype .txt.
     #[arg(short = 'i', long = "input")]
@@ -316,6 +365,16 @@ pub struct ProjectBedArgs {
     /// Min fraction of expected overlap to keep a sample.
     #[arg(long, default_value = "0.95")]
     pub min_loadings_ratio: f64,
+}
+
+#[derive(Args, Clone)]
+pub struct HetSignalArgs {
+    /// Data dir with one subdir per sample, each with a genotype .txt.
+    #[arg(short = 'i', long = "input")]
+    pub input: PathBuf,
+    /// Output dir for per-sample .bvhs caches.
+    #[arg(long)]
+    pub out_dir: PathBuf,
 }
 
 #[derive(Args, Clone)]
@@ -547,9 +606,11 @@ fn main() -> Result<()> {
         Commands::EmitLong(args) => run_long_emit(args),
         Commands::AggregateLong(args) => run_long_aggregate(args),
         Commands::FastAlleleFreq(args) => run_fast_allele_freq(args),
+        Commands::TargetStudyDosage(args) => run_target_study_dosage(args),
         Commands::Fst(args) => run_fst(args),
         Commands::CohortBed(args) => run_cohort_bed(args),
         Commands::ProjectBed(args) => run_project_bed(args),
+        Commands::HetSignal(args) => run_het_signal(args),
         Commands::MergeAlleleFreq(args) => run_merge_allele_freq(args),
         Commands::DumpLong(args) => run_long_dump(args),
         Commands::ListMissingCache(args) => run_list_missing_cache(args),

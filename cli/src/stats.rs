@@ -441,6 +441,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
     migrate_legacy_schema(conn)?;
     conn.execute_batch(
         r#"
+        CREATE TABLE IF NOT EXISTS reference_sources (
+            source_id INTEGER PRIMARY KEY CHECK(source_id BETWEEN 0 AND 255),
+            code TEXT NOT NULL UNIQUE,
+            label TEXT NOT NULL,
+            description TEXT
+        );
         CREATE TABLE IF NOT EXISTS rsid_reference (
             rsid INTEGER PRIMARY KEY,
             chromosome TEXT NOT NULL,
@@ -454,7 +460,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
             position INTEGER NOT NULL,
             reference TEXT NOT NULL,
             alternates TEXT NOT NULL,
-            source TEXT
+            source TEXT,
+            source_id INTEGER CHECK(source_id BETWEEN 0 AND 255),
+            FOREIGN KEY(source_id) REFERENCES reference_sources(source_id)
         );
         CREATE TABLE IF NOT EXISTS grch38_non_rsids (
             snp_name TEXT PRIMARY KEY,
@@ -464,7 +472,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
             reference TEXT NOT NULL,
             alternates TEXT NOT NULL,
             source TEXT NOT NULL DEFAULT 'ensembl_grch38',
-            note TEXT
+            note TEXT,
+            source_id INTEGER CHECK(source_id BETWEEN 0 AND 255),
+            FOREIGN KEY(source_id) REFERENCES reference_sources(source_id)
         );
         CREATE TABLE IF NOT EXISTS illumina_probe_manifest (
             row_order INTEGER PRIMARY KEY,
@@ -479,15 +489,37 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_rsid_reference_pos
             ON rsid_reference(chromosome, position);
+        CREATE INDEX IF NOT EXISTS idx_rsid_reference_user_source_id
+            ON rsid_reference_user(source_id);
         CREATE INDEX IF NOT EXISTS idx_grch38_non_rsids_pos
             ON grch38_non_rsids(chromosome, position);
         CREATE INDEX IF NOT EXISTS idx_grch38_non_rsids_rsid
             ON grch38_non_rsids(rsid);
+        CREATE INDEX IF NOT EXISTS idx_grch38_non_rsids_source_id
+            ON grch38_non_rsids(source_id);
         CREATE INDEX IF NOT EXISTS idx_illumina_probe_manifest_rsid
             ON illumina_probe_manifest(rsid);
         CREATE INDEX IF NOT EXISTS idx_illumina_probe_manifest_pos
             ON illumina_probe_manifest(chromosome, position);
         "#,
+    )?;
+    if !has_column(conn, "rsid_reference_user", "source_id")? {
+        conn.execute_batch(
+            "ALTER TABLE rsid_reference_user
+                ADD COLUMN source_id INTEGER CHECK(source_id BETWEEN 0 AND 255);",
+        )?;
+    }
+    if !has_column(conn, "grch38_non_rsids", "source_id")? {
+        conn.execute_batch(
+            "ALTER TABLE grch38_non_rsids
+                ADD COLUMN source_id INTEGER CHECK(source_id BETWEEN 0 AND 255);",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_rsid_reference_user_source_id
+            ON rsid_reference_user(source_id);
+         CREATE INDEX IF NOT EXISTS idx_grch38_non_rsids_source_id
+            ON grch38_non_rsids(source_id);",
     )?;
     Ok(())
 }

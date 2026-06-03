@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use dashmap::DashMap;
 use rayon::prelude::*;
 
-use crate::genotype_reader::{detect_delimiter, RowOutcome, RowParser};
+use crate::genotype_reader::{detect_delimiter, open_text_reader, RowOutcome, RowParser};
 use crate::CohortBedArgs;
 
 const LOOKAHEAD_LINES: usize = 2048;
@@ -43,12 +43,20 @@ pub fn run_cohort_bed(args: CohortBedArgs) -> Result<()> {
     // id). After a worker sees the panel once, subsequent samples resolve rsids
     // from this local map with zero shared-map access — so the ~1e9 lookups stop
     // contending on the DashMap shards (which all samples hit identically).
+    // A bad file must not abort the cohort: log it and treat it as an empty
+    // sample (all-missing column) so the rest of the pipeline keeps running.
     let per_sample: Vec<Vec<(u32, u8, u8)>> = samples
         .par_iter()
-        .map_init(HashMap::<String, u32>::new, |local, (_sid, path)| {
-            parse_sample(path, &interner, local)
+        .map_init(HashMap::<String, u32>::new, |local, (sid, path)| {
+            parse_sample(path, &interner, local).unwrap_or_else(|e| {
+                eprintln!(
+                    "⚠️  cohort-bed: skipping unreadable sample {sid} ({}): {e:#}",
+                    path.display()
+                );
+                Vec::new()
+            })
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
     eprintln!(
         "🧬 cohort-bed: parsed {} samples in {:.2}s",
         samples.len(),
@@ -323,9 +331,8 @@ fn parse_sample(
     interner: &Interner,
     local: &mut HashMap<String, u32>,
 ) -> Result<Vec<(u32, u8, u8)>> {
-    use std::io::{BufRead, BufReader};
-    let file = File::open(path).with_context(|| format!("Open {:?}", path))?;
-    let mut reader = BufReader::new(file);
+    use std::io::BufRead;
+    let mut reader = open_text_reader(path)?;
     let mut buffered: Vec<String> = Vec::new();
     let mut buf = String::new();
     while buffered.len() < LOOKAHEAD_LINES {
@@ -344,7 +351,12 @@ fn parse_sample(
     let mut out: Vec<(u32, u8, u8)> = Vec::new();
 
     let mut handle = |parser: &mut RowParser, line: &str| -> Result<()> {
-        if let RowOutcome::Parsed(row) = parser.consume_line(line)? {
+        // A bad row must not break the file: skip it and keep going.
+        let outcome = match parser.consume_line(line) {
+            Ok(o) => o,
+            Err(_) => return Ok(()),
+        };
+        if let RowOutcome::Parsed(row) = outcome {
             // variant_id = rsid, else chrom:pos (matches read_pipeline_genotypes)
             let rsid = if row.rsid.is_empty() {
                 format!("{}:{}", row.chrom, row.pos)
@@ -414,7 +426,7 @@ fn discover_samples(data_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
             .with_context(|| format!("Read dir {:?}", dir))?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("txt"))
+            .filter(|p| p.is_file() && is_genotype_text_file(p))
             .collect();
         txts.sort();
         if let Some(first) = txts.into_iter().next() {
@@ -427,4 +439,16 @@ fn discover_samples(data_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
         }
     }
     Ok(samples)
+}
+
+fn is_genotype_text_file(path: &Path) -> bool {
+    match path.extension().and_then(|x| x.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("txt") => true,
+        Some(ext) if ext.eq_ignore_ascii_case("gz") => path
+            .file_stem()
+            .and_then(|stem| Path::new(stem).extension())
+            .and_then(|x| x.to_str())
+            .is_some_and(|inner| inner.eq_ignore_ascii_case("txt")),
+        _ => false,
+    }
 }

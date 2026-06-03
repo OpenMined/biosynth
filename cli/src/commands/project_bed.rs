@@ -7,7 +7,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 
-use crate::genotype_reader::{detect_delimiter, RowOutcome, RowParser};
+use crate::genotype_reader::{detect_delimiter, open_text_reader, RowOutcome, RowParser};
 use crate::ProjectBedArgs;
 
 const LOOKAHEAD_LINES: usize = 2048;
@@ -41,10 +41,20 @@ pub fn run_project_bed(args: ProjectBedArgs) -> Result<()> {
     // interner contention (each sample matches against the fixed 76k panel).
     let min_gs = args.min_gs;
     let parse_start = Instant::now();
+    // A bad file must not abort the run: log it and treat it as 0 matches (the
+    // overlap filter then drops it), so the rest of the cohort still projects.
     let parsed: Vec<SampleHits> = samples
         .par_iter()
-        .map(|(_sid, path)| parse_sample(path, &panel, min_gs))
-        .collect::<Result<Vec<_>>>()?;
+        .map(|(sid, path)| {
+            parse_sample(path, &panel, min_gs).unwrap_or_else(|e| {
+                eprintln!(
+                    "⚠️  project-bed: skipping unreadable sample {sid} ({}): {e:#}",
+                    path.display()
+                );
+                SampleHits { rows: Vec::new() }
+            })
+        })
+        .collect::<Vec<_>>();
     eprintln!(
         "🧬 project-bed: parsed {} samples in {:.2}s",
         samples.len(),
@@ -198,8 +208,7 @@ fn load_panel(path: &Path) -> Result<Panel> {
 /// Parse one sample: apply fast_convert's projection filters and match to the
 /// panel by variant key. Dedup repeated keys keep-first. Returns matched rows.
 fn parse_sample(path: &Path, panel: &Panel, min_gs: f32) -> Result<SampleHits> {
-    let file = File::open(path).with_context(|| format!("Open {:?}", path))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = open_text_reader(path)?;
     let mut buffered: Vec<String> = Vec::new();
     let mut buf = String::new();
     while buffered.len() < LOOKAHEAD_LINES {
@@ -218,7 +227,12 @@ fn parse_sample(path: &Path, panel: &Panel, min_gs: f32) -> Result<SampleHits> {
     let mut rows: Vec<(u32, u8, u8)> = Vec::new();
 
     let mut handle = |parser: &mut RowParser, line: &str| -> Result<()> {
-        if let RowOutcome::Parsed(row) = parser.consume_line(line)? {
+        // A bad row must not break the file: skip it and keep going.
+        let outcome = match parser.consume_line(line) {
+            Ok(o) => o,
+            Err(_) => return Ok(()),
+        };
+        if let RowOutcome::Parsed(row) = outcome {
             // autosome 1-22 (chrom already cleaned by RowParser)
             let chrom_int: i64 = match row.chrom.parse() {
                 Ok(c) if (1..=22).contains(&c) => c,
@@ -412,7 +426,7 @@ fn discover_samples(data_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
             .with_context(|| format!("Read dir {:?}", dir))?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("txt"))
+            .filter(|p| p.is_file() && is_genotype_text_file(p))
             .collect();
         txts.sort();
         if let Some(first) = txts.into_iter().next() {
@@ -425,4 +439,16 @@ fn discover_samples(data_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
         }
     }
     Ok(samples)
+}
+
+fn is_genotype_text_file(path: &Path) -> bool {
+    match path.extension().and_then(|x| x.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("txt") => true,
+        Some(ext) if ext.eq_ignore_ascii_case("gz") => path
+            .file_stem()
+            .and_then(|stem| Path::new(stem).extension())
+            .and_then(|x| x.to_str())
+            .is_some_and(|inner| inner.eq_ignore_ascii_case("txt")),
+        _ => false,
+    }
 }
