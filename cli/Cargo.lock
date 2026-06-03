@@ -112,6 +112,7 @@ dependencies = [
  "clap",
  "csv",
  "dashmap",
+ "flate2",
  "glob",
  "indicatif",
  "noodles",

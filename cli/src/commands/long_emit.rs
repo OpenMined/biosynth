@@ -8,13 +8,14 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 
 use crate::download::ensure_reference_db;
-use crate::genotype_reader::{detect_delimiter, RowOutcome, RowParser};
+use crate::genotype_reader::{detect_delimiter, open_text_reader, RowOutcome, RowParser};
 use crate::long_rows::{
     is_snp, locus_key, normalize_sequence, parse_alternates, parse_genotype_dosages,
     parse_vcf_gt_dosages, vcf_gt_from_sample, vcf_sample_name, LongRow, LongRowWriter,
 };
 use crate::rsid_cache::normalize_rsid;
 use crate::stats::{ReferenceVariant, StatsStore};
+use crate::util::genotype_file_stem;
 use crate::{EmitLongArgs, WarnDetail};
 use rusqlite::OptionalExtension;
 
@@ -250,8 +251,7 @@ fn parse_genotype_file_to_pending(
     resolver: &mut ReferenceResolver,
     missing_logger: &mut MissingRefLogger,
 ) -> Result<(Vec<PendingLongRow>, EmitStats)> {
-    let input_file = File::open(input).with_context(|| format!("Open {:?}", input))?;
-    let mut reader = BufReader::new(input_file);
+    let mut reader = open_text_reader(input)?;
     let mut buffered_lines: Vec<String> = Vec::new();
     let mut buffer = String::new();
 
@@ -643,10 +643,7 @@ fn resolve_output_path(input: &Path, output: Option<&PathBuf>) -> Result<PathBuf
     if let Some(out) = output {
         return Ok(out.clone());
     }
-    let stem = input
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("output");
+    let stem = genotype_file_stem(input).unwrap_or_else(|| "output".to_string());
     let mut out = input.with_file_name(format!("{stem}.bvlr"));
     if let Some(parent) = input.parent() {
         if parent.as_os_str().is_empty() {
@@ -657,9 +654,7 @@ fn resolve_output_path(input: &Path, output: Option<&PathBuf>) -> Result<PathBuf
 }
 
 pub(crate) fn default_participant(input: &Path) -> String {
-    input
-        .file_stem()
-        .and_then(|stem| stem.to_str())
+    genotype_file_stem(input)
         .map(|stem| stem.replace(' ', "_"))
         .filter(|stem| !stem.is_empty())
         .unwrap_or_else(|| "SAMPLE".to_string())

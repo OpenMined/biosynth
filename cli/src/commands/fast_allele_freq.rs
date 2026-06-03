@@ -325,7 +325,7 @@ fn write_allele_freq(path: &Path, loci: &LociMap) -> Result<()> {
     Ok(())
 }
 
-fn collect_input_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+pub(crate) fn collect_input_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for input in inputs {
         if input.is_file() {

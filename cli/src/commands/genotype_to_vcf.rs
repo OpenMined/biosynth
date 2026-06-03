@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -9,10 +9,10 @@ use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
 use crate::download::ensure_reference_db;
-use crate::genotype_reader::{detect_delimiter, RowOutcome, RowParser};
+use crate::genotype_reader::{detect_delimiter, open_text_reader, RowOutcome, RowParser};
 use crate::rsid_cache::{default_cache_path, normalize_rsid, RsidCache};
 use crate::stats::{ReferenceVariant, StatsStore};
-use crate::util::collect_input_files;
+use crate::util::{collect_input_files, genotype_file_stem};
 use crate::GenotypeToVcfArgs;
 
 const LOOKAHEAD_LINES: usize = 2048;
@@ -133,8 +133,7 @@ fn convert_file(
     missing_log_path: &Path,
     include_metrics: bool,
 ) -> Result<ConversionStats> {
-    let input_file = File::open(input).with_context(|| format!("Open {:?}", input))?;
-    let mut reader = BufReader::new(input_file);
+    let mut reader = open_text_reader(input)?;
     let mut buffered_lines = Vec::new();
     let mut buffer = String::new();
 
@@ -566,10 +565,7 @@ fn resolve_output_paths(args: &GenotypeToVcfArgs, input: &Path) -> Result<Output
 }
 
 fn default_output_path(input: &Path, outdir: Option<&PathBuf>, gzip: bool) -> PathBuf {
-    let base_name = input
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("output");
+    let base_name = genotype_file_stem(input).unwrap_or_else(|| "output".to_string());
     let filename = if gzip {
         format!("{base_name}.vcf.gz")
     } else {
@@ -601,9 +597,7 @@ fn default_sample_name(input: &Path) -> String {
             return prefix.to_string();
         }
     }
-    input
-        .file_stem()
-        .and_then(|stem| stem.to_str())
+    genotype_file_stem(input)
         .map(|stem| stem.replace(' ', "_"))
         .filter(|stem| !stem.is_empty())
         .unwrap_or_else(|| "SAMPLE".to_string())

@@ -1,9 +1,10 @@
 use std::collections::{BTreeSet, HashMap};
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+
+use crate::genotype_reader::open_text_reader;
 
 const LOOKAHEAD_LINES: usize = 2048;
 const COMMENT_PREFIXES: [&str; 2] = ["#", "//"];
@@ -63,8 +64,8 @@ pub fn process_file<F>(path: &Path, mut on_variant: F) -> Result<ParsedFile>
 where
     F: FnMut(&VariantRecord, &FileMetadata) -> Result<()>,
 {
-    let file = File::open(path).with_context(|| format!("Failed to open {:?}", path))?;
-    let mut reader = BufReader::new(file);
+    let mut reader =
+        open_text_reader(path).with_context(|| format!("Failed to open {:?}", path))?;
     let mut buffered_lines: Vec<String> = Vec::new();
     let mut buffer = String::new();
 

@@ -1,6 +1,10 @@
 use std::collections::{BTreeSet, HashMap};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use flate2::read::MultiGzDecoder;
 
 const COMMENT_PREFIXES: [&str; 2] = ["#", "//"];
 
@@ -46,6 +50,21 @@ pub enum RowOutcome {
     Parsed(GenotypeRow),
     Skipped,
     Ignored,
+}
+
+pub fn open_text_reader(path: &Path) -> Result<Box<dyn BufRead>> {
+    let file = File::open(path).with_context(|| format!("Open {:?}", path))?;
+    if is_gzip_path(path) {
+        Ok(Box::new(BufReader::new(MultiGzDecoder::new(file))))
+    } else {
+        Ok(Box::new(BufReader::new(file)))
+    }
+}
+
+pub fn is_gzip_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -174,12 +193,28 @@ impl RowParser {
         }
 
         let header = self.header.as_ref().expect("header must be set");
+        let genotype_aliases = self.alias_map.get("genotype").cloned();
         let mut row_map: HashMap<String, String> = HashMap::new();
+        let mut vendor_missing_gt = false;
         for (idx, value) in fields.into_iter().enumerate() {
             if idx >= header.len() {
                 continue;
             }
-            row_map.insert(normalize_name(&header[idx]), strip_inline_comment(&value));
+            let norm = normalize_name(&header[idx]);
+            // Vendor missing genotype (#N/A) -> drop the whole row, matching
+            // genotype_normalizer. Detect on the RAW value before
+            // strip_inline_comment turns "#N/A" into "" (its leading '#').
+            if matches!(value.trim(), "#N/A" | "#n/a")
+                && genotype_aliases
+                    .as_ref()
+                    .is_some_and(|a| a.contains(norm.as_str()))
+            {
+                vendor_missing_gt = true;
+            }
+            row_map.insert(norm, strip_inline_comment(&value));
+        }
+        if vendor_missing_gt {
+            return Ok(RowOutcome::Skipped);
         }
 
         if self.carigenetics || looks_like_illumina_row(&row_map) {
