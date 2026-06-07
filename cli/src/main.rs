@@ -201,6 +201,10 @@ pub struct GenotypeToVcfArgs {
     /// Optional rsid cache file for fallback lookups.
     #[arg(long)]
     pub cache: Option<PathBuf>,
+    /// Optional TSV map overriding emitted VCF loci/ref/alt by rsID.
+    /// Expected columns: rsid, chrom, pos, ref, alt.
+    #[arg(long)]
+    pub coordinate_map: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]

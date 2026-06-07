@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
@@ -50,6 +49,10 @@ pub fn run_genotype_to_vcf(args: GenotypeToVcfArgs) -> Result<()> {
     };
     let reference_map = load_reference_map(&store)?;
     let position_map = load_position_map(&store)?;
+    let coordinate_map = match args.coordinate_map.as_deref() {
+        Some(path) => load_coordinate_map(path)?,
+        None => HashMap::new(),
+    };
 
     let cache_path = args.cache.clone().unwrap_or_else(default_cache_path);
     let cache = if cache_path.exists() {
@@ -81,6 +84,7 @@ pub fn run_genotype_to_vcf(args: GenotypeToVcfArgs) -> Result<()> {
             &output_paths,
             &reference_map,
             &position_map,
+            &coordinate_map,
             &cache,
             &sample_name,
             &missing_log_path,
@@ -128,6 +132,7 @@ fn convert_file(
     output_paths: &OutputPaths,
     reference_map: &HashMap<i64, ReferenceVariant>,
     position_map: &HashMap<(String, i64), ReferenceVariant>,
+    coordinate_map: &HashMap<i64, CoordinateOverride>,
     cache: &RsidCache,
     sample_name: &str,
     missing_log_path: &Path,
@@ -179,7 +184,16 @@ fn convert_file(
 
     let results = pool.install(|| {
         rows.par_iter()
-            .map(|row| convert_row(reference_map, position_map, cache, row, include_metrics))
+            .map(|row| {
+                convert_row(
+                    reference_map,
+                    position_map,
+                    coordinate_map,
+                    cache,
+                    row,
+                    include_metrics,
+                )
+            })
             .collect::<Vec<RowResult>>()
     });
 
@@ -195,6 +209,9 @@ fn convert_file(
     #[derive(Clone)]
     struct Emit {
         key: String,
+        chrom_rank: u16,
+        chrom: String,
+        pos: i64,
         rsid: String,
         gt: String,
         line: String,
@@ -213,6 +230,9 @@ fn convert_file(
             let (chrom, pos) = result.locus.clone().unwrap_or_default();
             emits.push(Emit {
                 key: format!("{}\t{}\t{}", chrom, pos, result.rsid),
+                chrom_rank: contig_rank(&chrom),
+                chrom,
+                pos,
                 rsid: result.rsid,
                 gt: result.gt.unwrap_or_else(|| "./.".to_string()),
                 line,
@@ -232,6 +252,11 @@ fn convert_file(
         }
         groups.entry(e.key.clone()).or_default().push(e);
     }
+    order.sort_by(|left, right| {
+        let a = &groups[left][0];
+        let b = &groups[right][0];
+        (a.chrom_rank, &a.chrom, a.pos, &a.rsid).cmp(&(b.chrom_rank, &b.chrom, b.pos, &b.rsid))
+    });
 
     let mut written = 0usize;
     for key in order {
@@ -296,6 +321,7 @@ fn collect_row(
 fn convert_row(
     reference_map: &HashMap<i64, ReferenceVariant>,
     position_map: &HashMap<(String, i64), ReferenceVariant>,
+    coordinate_map: &HashMap<i64, CoordinateOverride>,
     cache: &RsidCache,
     row: &crate::genotype_reader::GenotypeRow,
     include_metrics: bool,
@@ -332,11 +358,20 @@ fn convert_row(
     }
     let rsid_label = rsid_label.as_str();
 
+    let rsid_int = normalize_rsid(rsid_label)
+        .trim_start_matches("rs")
+        .parse::<i64>()
+        .ok();
+    let coordinate_override = rsid_int.and_then(|rsid| coordinate_map.get(&rsid));
+
     let mut unresolved = false;
     let mut reference = "N".to_string();
     let mut alternates: Vec<String> = Vec::new();
 
-    if let Some(resolved_ref) = resolved.as_ref() {
+    if let Some(override_ref) = coordinate_override {
+        reference = override_ref.reference.clone();
+        alternates = override_ref.alternates.clone();
+    } else if let Some(resolved_ref) = resolved.as_ref() {
         reference = resolved_ref.reference.clone();
         alternates = resolved_ref.alternates.clone();
     } else {
@@ -400,12 +435,15 @@ fn convert_row(
 
     result.stats.written_rows += 1;
     result.rsid = rsid_label.to_string();
-    result.locus = Some((row.chrom.clone(), row.pos));
+    let (emit_chrom, emit_pos) = coordinate_override
+        .map(|entry| (entry.chrom.clone(), entry.pos))
+        .unwrap_or_else(|| (row.chrom.clone(), row.pos));
+    result.locus = Some((emit_chrom.clone(), emit_pos));
     result.gt = Some(gt_call.clone());
     result.line = Some(format!(
         "{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}\t{}\t{}\n",
-        row.chrom,
-        row.pos,
+        emit_chrom,
+        emit_pos,
         rsid_label,
         reference,
         alt_field,
@@ -438,6 +476,16 @@ fn force_nocall(line: &str) -> String {
     out
 }
 
+fn contig_rank(chrom: &str) -> u16 {
+    let normalized = chrom.trim().trim_start_matches("chr");
+    match normalized {
+        "X" => 23,
+        "Y" => 24,
+        "M" | "MT" => 25,
+        _ => normalized.parse::<u16>().unwrap_or(10_000),
+    }
+}
+
 fn resolve_reference(
     rsid: &str,
     reference_map: &HashMap<i64, ReferenceVariant>,
@@ -468,6 +516,67 @@ fn resolve_reference(
     None
 }
 
+fn load_coordinate_map(path: &Path) -> Result<HashMap<i64, CoordinateOverride>> {
+    let reader = BufReader::new(
+        File::open(path).with_context(|| format!("Open coordinate map {:?}", path))?,
+    );
+    let mut map = HashMap::new();
+    for (line_no, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("Read coordinate map {:?}", path))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = trimmed.split('\t').collect();
+        if fields.len() < 5 {
+            bail!(
+                "Coordinate map {:?}: line {} has fewer than 5 tab-separated fields",
+                path,
+                line_no + 1
+            );
+        }
+        if line_no == 0 && fields[0].eq_ignore_ascii_case("rsid") {
+            continue;
+        }
+        let rsid = normalize_rsid(fields[0])
+            .trim_start_matches("rs")
+            .parse::<i64>()
+            .with_context(|| {
+                format!(
+                    "Coordinate map {:?}: invalid rsid '{}' on line {}",
+                    path,
+                    fields[0],
+                    line_no + 1
+                )
+            })?;
+        let chrom = fields[1].trim().trim_start_matches("chr").to_string();
+        let pos = fields[2].trim().parse::<i64>().with_context(|| {
+            format!(
+                "Coordinate map {:?}: invalid position '{}' on line {}",
+                path,
+                fields[2],
+                line_no + 1
+            )
+        })?;
+        let reference = normalize_sequence(fields[3]);
+        let alternates = parse_alternates(fields[4]);
+        if reference.is_empty() || alternates.is_empty() {
+            bail!(
+                "Coordinate map {:?}: empty ref/alt on line {}",
+                path,
+                line_no + 1
+            );
+        }
+        map.entry(rsid).or_insert(CoordinateOverride {
+            chrom,
+            pos,
+            reference,
+            alternates,
+        });
+    }
+    Ok(map)
+}
+
 fn write_vcf_header(
     writer: &mut BufWriter<File>,
     sample_name: &str,
@@ -491,6 +600,10 @@ fn write_vcf_header(
     writeln!(
         writer,
         "##INFO=<ID=UNRESOLVED,Number=0,Type=Flag,Description=\"Non-ACGT or missing genotype\">"
+    )?;
+    writeln!(
+        writer,
+        "##INFO=<ID=CONFLICT,Number=0,Type=Flag,Description=\"Duplicate probes disagree; genotype forced to no-call\">"
     )?;
     writeln!(
         writer,
@@ -604,14 +717,17 @@ fn default_sample_name(input: &Path) -> String {
 }
 
 fn gzip_output(path: &Path) -> Result<()> {
-    let status = Command::new("gzip")
-        .arg("-f")
-        .arg(path)
-        .status()
-        .with_context(|| "Failed to execute gzip")?;
-    if !status.success() {
-        bail!("gzip exited with status {}", status);
-    }
+    let mut final_name = path.as_os_str().to_os_string();
+    final_name.push(".gz");
+    let final_path = PathBuf::from(final_name);
+    let input = File::open(path).with_context(|| format!("Open {:?}", path))?;
+    let mut reader = BufReader::new(input);
+    let output = File::create(&final_path).with_context(|| format!("Create {:?}", final_path))?;
+    let mut writer = noodles::bgzf::io::Writer::new(output);
+    std::io::copy(&mut reader, &mut writer)
+        .with_context(|| format!("BGZF-compress {:?} to {:?}", path, final_path))?;
+    writer.finish().context("Finish BGZF stream")?;
+    std::fs::remove_file(path).with_context(|| format!("Remove temporary VCF {:?}", path))?;
     Ok(())
 }
 
@@ -691,6 +807,14 @@ impl MissingLogger {
 }
 
 struct ResolvedReference {
+    reference: String,
+    alternates: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CoordinateOverride {
+    chrom: String,
+    pos: i64,
     reference: String,
     alternates: Vec<String>,
 }
