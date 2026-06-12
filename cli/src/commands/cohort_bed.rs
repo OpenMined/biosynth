@@ -398,17 +398,30 @@ fn parse_sample(
     Ok(out)
 }
 
-/// First two chars of the genotype -> allele codes (A=1,C=2,G=3,T=4, else 0).
+/// Convert compact genotype calls to allele codes (A=1,C=2,G=3,T=4, else 0).
+/// Single-letter calls occur for haploid regions such as male chrX in 23andMe
+/// style files; encode them as homozygous so PLINK/ADMIXTURE can use them with
+/// downstream haploid handling instead of treating them as missing.
 fn allele_codes(gt: &str) -> (u8, u8) {
-    let bytes = gt.as_bytes();
-    let code = |b: Option<&u8>| match b {
+    let compact = gt
+        .as_bytes()
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .map(|b| b.to_ascii_uppercase())
+        .collect::<Vec<_>>();
+    let code = |b: Option<u8>| match b {
         Some(b'A') => 1,
         Some(b'C') => 2,
         Some(b'G') => 3,
         Some(b'T') => 4,
         _ => 0,
     };
-    (code(bytes.first()), code(bytes.get(1)))
+    if compact.len() == 1 {
+        let c = code(compact.first().copied());
+        return (c, c);
+    }
+    (code(compact.first().copied()), code(compact.get(1).copied()))
 }
 
 /// Discover samples like fast_pipeline: sorted subdirs, first sorted *.txt in each.
@@ -450,5 +463,28 @@ fn is_genotype_text_file(path: &Path) -> bool {
             .and_then(|x| x.to_str())
             .is_some_and(|inner| inner.eq_ignore_ascii_case("txt")),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allele_codes;
+
+    #[test]
+    fn allele_codes_duplicates_single_letter_haploid_calls() {
+        assert_eq!(allele_codes("G"), (3, 3));
+        assert_eq!(allele_codes(" t "), (4, 4));
+    }
+
+    #[test]
+    fn allele_codes_keeps_diploid_calls() {
+        assert_eq!(allele_codes("AG"), (1, 3));
+        assert_eq!(allele_codes("CC"), (2, 2));
+    }
+
+    #[test]
+    fn allele_codes_treats_no_calls_as_missing() {
+        assert_eq!(allele_codes("--"), (0, 0));
+        assert_eq!(allele_codes("0"), (0, 0));
     }
 }
