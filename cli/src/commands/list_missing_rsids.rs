@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
-use crate::genotype_reader::{detect_delimiter, RowOutcome, RowParser};
+use crate::genotype_reader::{detect_delimiter, open_text_reader, RowOutcome, RowParser};
 use crate::rsid_cache::normalize_rsid;
 use crate::stats::StatsStore;
 use crate::util::collect_input_files;
@@ -64,8 +64,7 @@ fn collect_missing_for_file(
     known: &std::collections::HashSet<i64>,
     missing: &mut HashMap<String, MissingEntry>,
 ) -> Result<()> {
-    let input = File::open(path).with_context(|| format!("Open {:?}", path))?;
-    let mut reader = BufReader::new(input);
+    let mut reader = open_text_reader(path)?;
     let mut buffered_lines = Vec::new();
     let mut buffer = String::new();
 
