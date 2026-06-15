@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
@@ -60,7 +60,7 @@ pub fn run_list_missing_rsids(args: ListMissingRsidsArgs) -> Result<()> {
 }
 
 fn collect_missing_for_file(
-    path: &PathBuf,
+    path: &Path,
     known: &std::collections::HashSet<i64>,
     missing: &mut HashMap<String, MissingEntry>,
 ) -> Result<()> {

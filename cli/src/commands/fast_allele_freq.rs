@@ -252,7 +252,7 @@ fn discover_pvar_files(data_dir: &Path) -> Result<Vec<PathBuf>> {
             files.push(path);
         }
     }
-    files.sort_by(|a, b| pvar_sort_key(a).cmp(&pvar_sort_key(b)));
+    files.sort_by_key(|path| pvar_sort_key(path));
     Ok(files)
 }
 

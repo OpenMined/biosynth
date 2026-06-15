@@ -421,7 +421,10 @@ fn allele_codes(gt: &str) -> (u8, u8) {
         let c = code(compact.first().copied());
         return (c, c);
     }
-    (code(compact.first().copied()), code(compact.get(1).copied()))
+    (
+        code(compact.first().copied()),
+        code(compact.get(1).copied()),
+    )
 }
 
 /// Discover samples like fast_pipeline: sorted subdirs, first sorted *.txt in each.

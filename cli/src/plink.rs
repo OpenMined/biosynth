@@ -297,7 +297,7 @@ mod tests {
         let mut bed = File::create(prefix.with_extension("bed")).unwrap();
         bed.write_all(&[0x6c, 0x1b, 0x01]).unwrap();
         // S1: homozygous A1 (G) => 2, S2: hetero => 1, S3: homozygous A2 (A) => 0.
-        bed.write_all(&[0b00 | (0b10 << 2) | (0b11 << 4)]).unwrap();
+        bed.write_all(&[(0b10 << 2) | (0b11 << 4)]).unwrap();
 
         let mut rows = Vec::new();
         let stats = stream_plink_long_rows(&prefix, |row| {
