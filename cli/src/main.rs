@@ -7,6 +7,7 @@ mod download;
 mod genotype;
 mod genotype_reader;
 mod long_rows;
+mod plink;
 mod rsid_cache;
 mod stats;
 mod util;
@@ -32,6 +33,7 @@ use crate::commands::sync_rsid_cache::run_sync_rsid_cache;
 use crate::commands::synthetic::run_synthetic;
 use crate::commands::target_study_dosage::run_target_study_dosage;
 use crate::commands::update::run_update;
+use crate::plink::inspect_plink_prefix;
 
 mod commands {
     pub mod allele_report;
@@ -87,6 +89,8 @@ enum Commands {
     CohortBed(CohortBedArgs),
     /// Build a gnomAD-loadings-oriented PLINK bed for PCA projection.
     ProjectBed(ProjectBedArgs),
+    /// Inspect PLINK .bed/.bim/.fam dimensions and allele usability.
+    PlinkInfo(PlinkInfoArgs),
     /// Per-sample het-signal caches for sex-biased admixture NMF.
     HetSignal(HetSignalArgs),
     /// Inner-join per-population allele frequency TSVs into merged matrices.
@@ -215,6 +219,9 @@ pub struct EmitLongArgs {
     /// Input VCF file (plain or gz). Mutually exclusive with --input.
     #[arg(long)]
     pub vcf: Option<PathBuf>,
+    /// Input PLINK prefix; reads <prefix>.bed/.bim/.fam. Mutually exclusive with --input/--vcf.
+    #[arg(long)]
+    pub plink_prefix: Option<PathBuf>,
     /// Path to the SQLite database containing rsid_reference data.
     #[arg(long, default_value = "data/genostats.sqlite")]
     pub sqlite: PathBuf,
@@ -271,6 +278,21 @@ pub struct FastAlleleFreqArgs {
     /// Input genotype file(s) or directories (scanned recursively).
     #[arg(short = 'i', long = "input")]
     pub inputs: Vec<PathBuf>,
+    /// Input PLINK prefix(es); reads <prefix>.bed/.bim/.fam directly.
+    #[arg(long = "plink-prefix")]
+    pub plink_prefixes: Vec<PathBuf>,
+    /// Input PLINK2 directory; reads *.pvar(.zst) INFO AC/AN fields.
+    #[arg(long = "plink2-dir")]
+    pub plink2_dir: Option<PathBuf>,
+    /// INFO suffix for PLINK2 population-specific counts, e.g. EUR uses AC_EUR/AN_EUR.
+    #[arg(long = "plink2-info-suffix", default_value = "")]
+    pub plink2_info_suffix: String,
+    /// Include PLINK2 non-SNV alleles. By default only single-base REF/ALT rows are emitted.
+    #[arg(long = "plink2-include-non-snv", action = ArgAction::SetTrue)]
+    pub plink2_include_non_snv: bool,
+    /// Optional loci filter TSV. Accepts a `locus_key` column or chrom/pos/ref/alt columns.
+    #[arg(long = "loci-filter")]
+    pub loci_filter: Option<PathBuf>,
     /// Path to the SQLite database containing rsid_reference data.
     #[arg(long, default_value = "data/genostats.sqlite")]
     pub sqlite: PathBuf,
@@ -369,6 +391,13 @@ pub struct ProjectBedArgs {
     /// Min fraction of expected overlap to keep a sample.
     #[arg(long, default_value = "0.95")]
     pub min_loadings_ratio: f64,
+}
+
+#[derive(Args, Clone)]
+pub struct PlinkInfoArgs {
+    /// Input PLINK prefix; reads <prefix>.bed/.bim/.fam.
+    #[arg(long = "plink-prefix")]
+    pub plink_prefixes: Vec<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -614,6 +643,7 @@ fn main() -> Result<()> {
         Commands::Fst(args) => run_fst(args),
         Commands::CohortBed(args) => run_cohort_bed(args),
         Commands::ProjectBed(args) => run_project_bed(args),
+        Commands::PlinkInfo(args) => run_plink_info(args),
         Commands::HetSignal(args) => run_het_signal(args),
         Commands::MergeAlleleFreq(args) => run_merge_allele_freq(args),
         Commands::DumpLong(args) => run_long_dump(args),
@@ -626,4 +656,21 @@ fn main() -> Result<()> {
         Commands::Synthetic(args) => run_synthetic(args),
         Commands::Update(args) => run_update(args),
     }
+}
+
+fn run_plink_info(args: PlinkInfoArgs) -> Result<()> {
+    if args.plink_prefixes.is_empty() {
+        anyhow::bail!("Provide at least one --plink-prefix");
+    }
+    for prefix in &args.plink_prefixes {
+        let info = inspect_plink_prefix(prefix)?;
+        println!("prefix\t{}", prefix.display());
+        println!("samples\t{}", info.samples);
+        println!("variants\t{}", info.variants);
+        println!("snp_variants\t{}", info.snp_variants);
+        println!("bytes_per_variant\t{}", info.bytes_per_variant);
+        println!("bed_bytes\t{}", info.bed_bytes);
+        println!("expected_bed_bytes\t{}", info.expected_bed_bytes);
+    }
+    Ok(())
 }

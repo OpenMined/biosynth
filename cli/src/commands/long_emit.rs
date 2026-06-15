@@ -13,6 +13,7 @@ use crate::long_rows::{
     is_snp, locus_key, normalize_sequence, parse_alternates, parse_genotype_dosages,
     parse_vcf_gt_dosages, vcf_gt_from_sample, vcf_sample_name, LongRow, LongRowWriter,
 };
+use crate::plink::stream_plink_long_rows;
 use crate::rsid_cache::normalize_rsid;
 use crate::stats::{ReferenceVariant, StatsStore};
 use crate::util::genotype_file_stem;
@@ -25,8 +26,13 @@ pub fn run_long_emit(args: EmitLongArgs) -> Result<()> {
     let overall_start = Instant::now();
     let has_vcf = args.vcf.is_some();
     let has_inputs = !args.inputs.is_empty();
-    if has_vcf == has_inputs {
-        bail!("Provide either --vcf or --input (genotype files), but not both");
+    let has_plink = args.plink_prefix.is_some();
+    let input_modes = [has_vcf, has_inputs, has_plink]
+        .iter()
+        .filter(|&&enabled| enabled)
+        .count();
+    if input_modes != 1 {
+        bail!("Provide exactly one of --vcf, --input (genotype files), or --plink-prefix");
     }
 
     if has_vcf {
@@ -37,6 +43,31 @@ pub fn run_long_emit(args: EmitLongArgs) -> Result<()> {
             "✅ emit-long (vcf): {} variants, {} rows, {} missing-gt",
             stats.variants_seen, stats.rows_emitted, stats.missing_gt
         );
+        eprintln!(
+            "⏱️  emit-long: elapsed {:.2}s",
+            overall_start.elapsed().as_secs_f64()
+        );
+        println!("✅ Emitted long rows to {}", output_path.display());
+        return Ok(());
+    }
+
+    if has_plink {
+        if args.participant.is_some() {
+            bail!("--participant cannot be used with --plink-prefix; sample ids come from .fam");
+        }
+        let prefix = args.plink_prefix.as_ref().expect("plink prefix");
+        let output_path = resolve_output_path(prefix, args.output.as_ref())?;
+        let stats = emit_from_plink(prefix, &output_path)?;
+        eprintln!(
+            "✅ emit-long (plink): {} variants, {} rows, {} missing calls",
+            stats.variants_emitted, stats.rows_emitted, stats.missing_calls
+        );
+        if stats.skipped_non_snp > 0 || stats.skipped_bad_position > 0 {
+            eprintln!(
+                "⚠️  emit-long (plink): skipped non_snp={}, bad_position={}",
+                stats.skipped_non_snp, stats.skipped_bad_position
+            );
+        }
         eprintln!(
             "⏱️  emit-long: elapsed {:.2}s",
             overall_start.elapsed().as_secs_f64()
@@ -117,6 +148,15 @@ pub fn run_long_emit(args: EmitLongArgs) -> Result<()> {
         overall_start.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+fn emit_from_plink(input_prefix: &Path, output: &Path) -> Result<crate::plink::PlinkScanStats> {
+    let mut writer = LongRowWriter::new(BufWriter::new(
+        File::create(output).with_context(|| format!("Create {:?}", output))?,
+    ));
+    let stats = stream_plink_long_rows(input_prefix, |row| writer.write_row(&row))?;
+    writer.flush()?;
+    Ok(stats)
 }
 
 pub(crate) struct EmitStats {
